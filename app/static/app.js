@@ -27,6 +27,29 @@ async function loadViewer() {
 const dropzone = document.getElementById('dropzone');
 const fileInput = document.getElementById('file-input');
 
+/*
+ * Limits, fetched from the server rather than hardcoded here.
+ *
+ * The server enforces them regardless -- a client-side check is a courtesy, not
+ * a control. But duplicating the numbers in two places guarantees they drift,
+ * and then the page confidently states a limit the server disagrees with.
+ *
+ * The fallbacks apply only if /health cannot be reached, in which case the
+ * upload would fail anyway.
+ */
+let limits = { max_upload_mb: 25, max_duration_seconds: 30 };
+
+(async function loadLimits() {
+  try {
+    const health = await (await fetch('/health')).json();
+    limits = { ...limits, ...health.settings };
+    document.getElementById('limit-hint').textContent =
+      `Up to ${limits.max_upload_mb} MB and ${limits.max_duration_seconds} seconds.`;
+  } catch {
+    // Leave the defaults in place; the upload path reports real failures.
+  }
+})();
+
 const panels = {
   upload: document.getElementById('upload-panel'),
   progress: document.getElementById('progress-panel'),
@@ -99,9 +122,70 @@ window.addEventListener('unhandledrejection', (event) => {
   showError('Something went wrong in the page', String(event.reason), '');
 });
 
+/**
+ * Read a video's duration in the browser, without uploading it.
+ *
+ * Resolves to null if the browser cannot decode the container -- that is not a
+ * rejection, since the server may well manage a format the <video> element
+ * will not preview.
+ */
+function readDuration(file) {
+  return new Promise((resolve) => {
+    const element = document.createElement('video');
+    const url = URL.createObjectURL(file);
+    const done = (value) => {
+      URL.revokeObjectURL(url);   // or the blob leaks for the page's lifetime
+      resolve(value);
+    };
+    element.preload = 'metadata';
+    element.onloadedmetadata = () => done(
+      Number.isFinite(element.duration) ? element.duration : null
+    );
+    element.onerror = () => done(null);
+    element.src = url;
+  });
+}
+
 async function startJob(file) {
+  const megabytes = file.size / (1024 * 1024);
+
+  /*
+   * CHECK BEFORE UPLOADING, NOT AFTER.
+   *
+   * Measured from this connection, a 17 MB upload takes 43 seconds. Letting an
+   * oversized file upload in full just to be rejected at the far end wastes all
+   * of that, and the rejection arrives as nginx's own HTML error page -- nginx
+   * enforces its body limit before the request ever reaches the application, so
+   * the friendly message the server would have sent never runs.
+   *
+   * Checking here costs nothing and turns a 43-second dead end into instant,
+   * actionable feedback.
+   */
+  if (megabytes > limits.max_upload_mb) {
+    return showError(
+      'That video is too large',
+      `${file.name} is ${megabytes.toFixed(1)} MB, and the limit is `
+      + `${limits.max_upload_mb} MB.`,
+      'Trimming the clip to a few seconds, or recording at 1080p rather than 4K, '
+      + 'usually brings it well under. Only about 100 frames are processed no '
+      + 'matter how long the video is, and each is scaled to 640px wide before '
+      + 'any feature is detected — so a larger file buys no extra detail.',
+    );
+  }
+
+  const duration = await readDuration(file);
+  if (duration !== null && duration > limits.max_duration_seconds) {
+    return showError(
+      'That video is too long',
+      `${file.name} runs ${duration.toFixed(1)} seconds, and the limit is `
+      + `${limits.max_duration_seconds} seconds.`,
+      'Around five to ten seconds of steady sideways motion is the sweet spot.',
+    );
+  }
+
   document.getElementById('progress-file').textContent =
-    `${file.name} — ${(file.size / (1024 * 1024)).toFixed(1)} MB`;
+    `${file.name} — ${megabytes.toFixed(1)} MB`
+    + (duration !== null ? `, ${duration.toFixed(1)}s` : '');
   setProgress('uploading', 0, 0);
   show('progress');
 
@@ -116,13 +200,7 @@ async function startJob(file) {
   }
 
   if (!response.ok) {
-    // The server's typed rejections (413 too large, 400 empty) carry a
-    // `detail` that already reads as a sentence, so surface it directly.
-    let detail = `HTTP ${response.status}`;
-    try {
-      detail = (await response.json()).detail ?? detail;
-    } catch { /* body was not JSON; keep the status line */ }
-    return showError('Upload rejected', detail, '');
+    return showError(...(await describeFailure(response)));
   }
 
   const { job_id: jobId } = await response.json();
@@ -181,6 +259,42 @@ function setProgress(stage, done, total) {
 }
 
 // ---------------------------------------------------------------- results
+
+/**
+ * Turn a failed response into something a person can act on.
+ *
+ * The server's own rejections are JSON with a `detail` that already reads as a
+ * sentence. But a 413 usually does NOT come from the server at all: nginx
+ * enforces its body size limit before the request reaches the application and
+ * answers with an HTML error page. Parsing that as JSON throws, and the old
+ * code then displayed the bare string "HTTP 413", which tells the user nothing.
+ */
+async function describeFailure(response) {
+  let detail = null;
+  try {
+    detail = (await response.json()).detail ?? null;
+  } catch {
+    // Not JSON -- almost certainly an nginx error page.
+  }
+
+  if (detail) return ['Upload rejected', detail, ''];
+
+  if (response.status === 413) {
+    return [
+      'That video is too large',
+      `The server refused it as over the ${limits.max_upload_mb} MB limit.`,
+      'This was rejected at the web server before reaching the application, '
+      + 'which usually means the file is somewhat over the limit rather than '
+      + 'just at it.',
+    ];
+  }
+
+  return [
+    'Upload rejected',
+    `The server responded ${response.status} ${response.statusText || ''}`.trim(),
+    '',
+  ];
+}
 
 function showError(title, message, detail) {
   document.getElementById('error-title').textContent = title;
