@@ -3,9 +3,9 @@
 Numbers as they are taken, so the README's table is transcribed rather than
 reconstructed. Every row records what was measured, on what, with which settings.
 
-**Nothing here is a submission number yet.** The brief requires timings from the
-demonstrated test environment, which is the EC2 `m7i-flex.large`. Laptop figures
-below exist only to establish shape and to catch surprises early.
+The brief requires timings from the demonstrated test environment, which is the
+EC2 `m7i-flex.large`. Laptop figures are kept alongside, clearly labelled, because
+the comparison between them turned out to be informative in its own right.
 
 ---
 
@@ -60,6 +60,78 @@ hardware, arrived at by measurement rather than assertion.
 `cv2.getNumThreads()` keeps returning 8 regardless. The timings above are real —
 1 thread is measurably slower — but the reported thread count is not. The probe
 therefore records `threads_requested` separately, and that is the field to quote.
+
+---
+
+## Probe on the TARGET instance — the submission numbers
+
+EC2 `m7i-flex.large` in eu-north-1a: Intel Xeon Platinum 8488C (Sapphire
+Rapids), 2 vCPU (**1 physical core, 2 threads**), 7.8 GB RAM, Ubuntu 24.04,
+Linux 6.17, OpenCV 4.14.0, Python 3.12.3.
+
+Clip: `tum_fr1_xyz.mp4`, 798 frames @ 31.15 fps → 266 processed @ 10 fps,
+640px working width, 1000 features, Lowe ratio 0.75.
+
+| stage | total ms | ms/frame | % of wall |
+|---|---|---|---|
+| decode | 455.1 | 1.71 | 13.3 |
+| orb | 1452.6 | 5.46 | 42.5 |
+| match | 1504.2 | 5.66 | 44.0 |
+| **wall** | **3420.3** | **12.86** | 100 |
+
+**12.9 ms/frame against a 100 ms budget — 87 ms/frame of headroom** for PnP,
+triangulation and bundle adjustment.
+
+### Stability under sustained load
+
+`m7i-flex` is a flex instance, so sustained full-rate CPU was worth checking
+before trusting any of the above. Six consecutive probe runs back to back:
+
+| run | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| ms/frame | 13.2 | 13.1 | 13.2 | 13.1 | 13.1 | 13.0 |
+
+Flat, with 0% CPU steal throughout. Timings from this instance are trustworthy
+for a job of this length. Worth re-checking during the longer parameter sweep,
+where sustained demand is higher.
+
+### The finding that changes a previous conclusion
+
+Compare the same clip on both machines:
+
+| stage | laptop (M-series, 8 threads) | EC2 (Xeon 8488C, 2 threads) |
+|---|---|---|
+| decode | 0.51 ms/frame (4%) | 1.71 ms/frame (13%) |
+| orb | **9.50 ms/frame (82%)** | **5.46 ms/frame (43%)** |
+| match | **1.49 ms/frame (13%)** | **5.66 ms/frame (44%)** |
+| wall | 11.52 ms/frame | 12.86 ms/frame |
+
+The totals are within 12% of each other, which is a coincidence — the
+composition is completely different. **ORB is faster on the server** (5.46 vs
+9.50) and **matching is nearly 4x slower** (5.66 vs 1.49).
+
+This retracts a conclusion drawn earlier from laptop numbers alone: *"ORB is 85%
+of the floor, so tuning per-frame cost is a conversation about ORB."* That is
+true on Apple Silicon and false on the deployment target, where matching is
+co-equal with ORB. Any tuning work has to treat the matcher as a first-class
+cost — reducing the feature count helps twice over, since brute-force matching
+is quadratic in descriptor count while ORB is roughly linear.
+
+It is also the clearest possible argument for CLAUDE.md's rule that timings come
+from the target instance and never from a dev laptop. The headline number would
+have been roughly right; the engineering conclusion drawn from it was wrong.
+
+### End-to-end through nginx on the instance
+
+| check | result |
+|---|---|
+| POST /api/jobs, 17 MB upload | **202 in 47 ms** |
+| poll → done | 3 polls, progress 0.03 → 0.55 → 1.00 |
+| 27 MB upload | 413 rejected |
+| unknown job id | 404 |
+| vendored three.module.js | 200, 603 KB |
+
+(Processing is still the stage-0 stub; what this verifies is the transport path.)
 
 ---
 
@@ -182,9 +254,6 @@ result.
       trajectory to evaluate.
 - [ ] **Cost of the focal-length heuristic**, measured as the ATE difference
       between measured K and 0.9 x width on the same clip.
-- [ ] **The same probe on the EC2 `m7i-flex.large`.** This is the number that
-      counts; everything above is shape-finding. Expect single-core speed, not
-      core count, to drive the difference.
 - [ ] Bundle adjustment cost per keyframe — the one stage with real risk of
       eating the budget.
 - [ ] The five-parameter sweep: processed fps, working resolution, features per

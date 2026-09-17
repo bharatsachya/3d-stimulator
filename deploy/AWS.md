@@ -114,7 +114,35 @@ curl -s localhost/health
 
 `opencv-python-headless` installs from a wheel, so there is no compile step and
 no `libgl1` to chase. That is the entire reason for preferring it over
-`opencv-python` on a server — see the note in `requirements.txt`.
+`opencv-python` on a server — see the note in `requirements.txt`. Measured on the
+instance: the whole dependency install takes **10.6 s** and peaks at 157 MB RSS.
+
+### Never copy a virtualenv between directories
+
+If you provision by copying files rather than `git clone`, exclude `.venv`.
+
+A venv's console scripts hardcode an **absolute** interpreter path in their
+shebang. Copying `~/slam/.venv` to `/opt/slam/.venv` leaves
+`#!/home/ubuntu/slam/.venv/bin/python3` at the top of `bin/uvicorn`, and since
+`/home/ubuntu` is mode 750 the `slam` service user cannot traverse it. systemd
+then reports:
+
+```
+Failed to execute /opt/slam/.venv/bin/uvicorn: Permission denied
+status=203/EXEC
+```
+
+which is thoroughly misleading — `ls -l` shows `-rwxr-xr-x slam slam` and even
+`test -x` passes, because the permission being denied belongs to the
+*interpreter named in the shebang*, not to the script. Delete the copied venv
+and recreate it at its final path:
+
+```bash
+sudo rm -rf /opt/slam/.venv
+sudo python3 -m venv /opt/slam/.venv
+sudo /opt/slam/.venv/bin/pip install -r /opt/slam/requirements.txt
+sudo chown -R slam: /opt/slam
+```
 
 ---
 
