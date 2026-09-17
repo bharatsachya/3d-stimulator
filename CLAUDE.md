@@ -58,7 +58,7 @@ say so before writing code.
 | Processed frame rate | 10 fps (~100 frames for a 10s video, 100ms/frame budget) |
 | Working resolution | 640px long edge |
 | Colour | Grayscale (ORB ignores colour) |
-| Limits | Reject > 30s or > 100MB at upload |
+| Limits | Reject > 60s or > 25MB at upload |
 
 ### Features and matching
 | Parameter | Value |

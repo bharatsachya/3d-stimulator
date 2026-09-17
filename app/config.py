@@ -31,7 +31,13 @@ class Settings:
     max_upload_bytes: int = _int("MAX_UPLOAD_BYTES", 25 * 1024 * 1024)
     # Checked after decode opens the file, because container metadata is the
     # only place duration lives and we do not trust the client to report it.
-    max_duration_seconds: float = _float("MAX_DURATION_SECONDS", 30.0)
+    #
+    # 60s, raised from 30s. Note what this does NOT change: the brief's target
+    # is a 10-second video processed in under 10 seconds, and that is still the
+    # number the README reports. A 60-second clip yields ~600 processed frames
+    # at 10fps and will take proportionally longer -- that is expected
+    # behaviour, not a missed budget.
+    max_duration_seconds: float = _float("MAX_DURATION_SECONDS", 60.0)
 
     # --- The five parameters that get swept ------------------------------
     # Starting points, not conclusions. See docs/measurements.md.
