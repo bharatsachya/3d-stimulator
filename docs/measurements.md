@@ -133,6 +133,31 @@ have been roughly right; the engineering conclusion drawn from it was wrong.
 
 (Processing is still the stage-0 stub; what this verifies is the transport path.)
 
+### Public round trip, laptop to Stockholm
+
+| check | result |
+|---|---|
+| POST 17 MB over the public internet | **43.2 s** |
+| 202 returned once bytes arrived | immediate |
+| poll -> done | 2 polls |
+| GET / | 200 in 0.43 s |
+
+That 43 seconds is **upload time, not processing time** — roughly 3.2 Mbit/s
+upstream from this connection. The "202 in milliseconds" property holds for the
+server: it responds the moment the body has arrived. But a reviewer watching the
+browser experiences the whole 43 seconds.
+
+Two consequences worth acting on:
+
+1. **It vindicates the 25 MB cap and the "short clips" hint.** A 25 MB upload on
+   this connection is over a minute of waiting before any work starts. The cap is
+   a UX decision at least as much as a memory one.
+
+2. **The upload needs a real progress indicator.** `fetch()` cannot report upload
+   progress; only `XMLHttpRequest` exposes `upload.onprogress`. Right now the bar
+   sits at "uploading" with no movement for the entire transfer, which is the
+   worst possible moment to look frozen. Fix this when the viewer is built.
+
 ---
 
 ## TUM RGB-D: real footage with real ground truth
