@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Runtime state — uploads spool here, results are written here.
+# Neither belongs in the repo: uploads are user data, results are regenerable.
+var/
+uploads/
+# Generated and recorded video stays out of the repo. The synthetic clips are
+# fully reproducible from tools/make_synthetic.py with its fixed seed, so
+# committing 40MB of derivable mp4 buys nothing; phone clips are just large.
+*.mp4
+*.mov
+*.avi
+samples/*.truth.json
+
+# Generated measurement output. The README table is committed by hand,
+# the raw sweep JSON is not.
+out/
+sweep-*.json
+
+# OS
+.DS_Store

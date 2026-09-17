@@ -1,0 +1,31 @@
+# Pinned so `pip install -r requirements.txt` reproduces this environment.
+# Resolved on Python 3.13; all support 3.11+.
+
+# --- Numerics ---
+# The whole pipeline is numpy arrays: descriptors, poses, 3D points.
+numpy==2.5.3
+
+# --- Computer vision ---
+# Pinned to the 4.x line, NOT 5.0, deliberately. OpenCV 5 is a major version
+# with signature and default changes across exactly the calls this pipeline
+# leans on. Nearly every reference, tutorial and StackOverflow answer for
+# findEssentialMat / solvePnPRansac describes 4.x behaviour, and this code has
+# to be explainable line by line against those references.
+# HEADLESS is deliberate. The plain `opencv-python` wheel links GUI toolkits
+# (GTK/Qt/X11) for cv2.imshow, which a server has no display for. The headless
+# wheel drops them: a much smaller image, no apt-get libgl1 dance on EC2, and
+# we never call imshow anyway -- debug frames get written with imwrite.
+opencv-python-headless==4.14.0.94
+
+# --- Optimization: bundle adjustment ---
+# scipy.optimize.least_squares with a sparse jac_sparsity mask.
+# Chosen over g2o/Ceres because it installs from a wheel and every line of the
+# residual function is readable. Slower than Ceres; that tradeoff is in the README.
+scipy==1.18.1
+
+# --- Web ---
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+# Required by FastAPI to parse multipart/form-data, i.e. the video upload.
+# FastAPI raises RuntimeError on the first UploadFile route without it.
+python-multipart==0.0.32
