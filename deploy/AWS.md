@@ -1,0 +1,160 @@
+# Deploying to AWS
+
+Target: EC2 `m7i-flex.large` — 2 vCPU, 8 GB, no GPU, Ubuntu 24.04, in
+**ap-northeast-2 (Seoul)**.
+
+Seoul is deliberate: the reviewer is in Seoul, and while the processing time is
+measured server-side and unaffected by geography, a ~200 ms round trip on every
+poll makes an otherwise responsive UI feel sluggish.
+
+No GPU anywhere in this document is an oversight. Sparse SLAM is CPU work, and
+the measured evidence is that this workload stops scaling past two threads — see
+`docs/measurements.md`. Two vCPUs is not a handicap here, it is sufficiency.
+
+---
+
+## 0. Prerequisites
+
+A configured AWS profile with EC2 permissions:
+
+```bash
+aws configure --profile slam      # personal account, not a shared one
+export AWS_PROFILE=slam
+export AWS_DEFAULT_REGION=ap-northeast-2
+aws sts get-caller-identity       # confirm which account you are in
+```
+
+---
+
+## 1. Key pair and security group
+
+```bash
+aws ec2 create-key-pair --key-name slam-key \
+  --query KeyMaterial --output text > ~/.ssh/slam-key.pem
+chmod 400 ~/.ssh/slam-key.pem
+
+SG=$(aws ec2 create-security-group --group-name slam-sg \
+  --description "Monocular SLAM demo" --query GroupId --output text)
+
+# HTTP open to the world: the reviewer has to be able to open the URL.
+aws ec2 authorize-security-group-ingress --group-id $SG \
+  --protocol tcp --port 80 --cidr 0.0.0.0/0
+
+# SSH restricted to your own address. Port 22 open to 0.0.0.0/0 is scanned
+# within minutes of an instance coming up.
+MY_IP=$(curl -s https://checkip.amazonaws.com)
+aws ec2 authorize-security-group-ingress --group-id $SG \
+  --protocol tcp --port 22 --cidr ${MY_IP}/32
+```
+
+Port 8000 is deliberately **not** opened. uvicorn binds to 127.0.0.1 and only
+nginx talks to it.
+
+---
+
+## 2. Launch
+
+```bash
+AMI=$(aws ssm get-parameters \
+  --names /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+  --query 'Parameters[0].Value' --output text)
+
+aws ec2 run-instances \
+  --image-id $AMI \
+  --instance-type m7i-flex.large \
+  --key-name slam-key \
+  --security-group-ids $SG \
+  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=20,VolumeType=gp3}' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=slam-assignment2}]'
+```
+
+An **elastic IP** is worth attaching: without one the public IP changes on every
+stop/start, and the URL in a submitted README stops working.
+
+```bash
+ALLOC=$(aws ec2 allocate-address --query AllocationId --output text)
+aws ec2 associate-address --instance-id <id> --allocation-id $ALLOC
+```
+
+> Elastic IPs are billed when **not** attached to a running instance. Release it
+> when the instance is terminated, or it quietly accrues charges.
+
+---
+
+## 3. Provision
+
+```bash
+ssh -i ~/.ssh/slam-key.pem ubuntu@<elastic-ip>
+
+sudo apt-get update
+# python3-venv is NOT included in Ubuntu's python3 package; without it
+# `python3 -m venv` fails with a message that does not name the missing package.
+sudo apt-get install -y python3-venv python3-pip nginx git
+
+sudo useradd --system --home /opt/slam --shell /usr/sbin/nologin slam
+sudo mkdir -p /opt/slam
+sudo chown $USER: /opt/slam
+git clone <repo-url> /opt/slam
+cd /opt/slam
+
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+sudo chown -R slam: /opt/slam
+
+sudo cp deploy/slam.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now slam
+
+sudo cp deploy/nginx.conf /etc/nginx/sites-available/slam
+sudo ln -sf /etc/nginx/sites-available/slam /etc/nginx/sites-enabled/slam
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+
+curl -s localhost/health
+```
+
+`opencv-python-headless` installs from a wheel, so there is no compile step and
+no `libgl1` to chase. That is the entire reason for preferring it over
+`opencv-python` on a server — see the note in `requirements.txt`.
+
+---
+
+## 4. Measure on the instance, not on a laptop
+
+This is the step the assignment actually grades.
+
+```bash
+cd /opt/slam
+./.venv/bin/python tools/make_synthetic.py --motion dolly   # regenerate the clip
+./.venv/bin/python tools/probe.py samples/synth_dolly.mp4 --json out/probe-ec2.json
+```
+
+Copy the resulting table into `docs/measurements.md`. Laptop numbers are shape-
+finding only and must never be quoted as the submission's timings.
+
+---
+
+## 5. Cost
+
+`m7i-flex.large` is roughly $0.09/hour on-demand, about $2/day, plus a few cents
+for the 20 GB gp3 volume. Set a budget alarm before walking away from it:
+
+```bash
+aws budgets create-budget --account-id <id> --budget \
+  '{"BudgetName":"slam","BudgetLimit":{"Amount":"20","Unit":"USD"},
+    "TimeUnit":"MONTHLY","BudgetType":"COST"}'
+```
+
+Free-tier eligibility depends on the account. Check the EC2 console's own label
+for the account you are launching in rather than assuming either way.
+
+---
+
+## 6. HTTPS — deliberately last
+
+Plain HTTP is sufficient for this deliverable. The frontend is served by the
+same origin as the API, so there is no cross-origin fetch and therefore no
+mixed-content blocking — the thing that would have forced TLS onto the critical
+path had the UI been hosted separately.
+
+If time allows at the end: point a DuckDNS subdomain at the elastic IP and run
+`certbot --nginx`. Do not do this before the pipeline exists.

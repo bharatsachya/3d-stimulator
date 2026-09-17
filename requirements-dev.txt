@@ -1,0 +1,8 @@
+# Development and test only. NOT installed on the EC2 instance -- the runtime
+# dependency list in requirements.txt is the one that ships.
+
+pytest==9.1.1
+# Starlette's TestClient needs an HTTP client to drive the ASGI app in-process.
+# On this Starlette version that is httpx2. Test-only: nothing in app/ or vslam/
+# makes an outbound HTTP call.
+httpx2==2.13.0

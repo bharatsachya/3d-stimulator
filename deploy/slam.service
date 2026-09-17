@@ -1,0 +1,64 @@
+# Monocular sparse SLAM as a systemd unit.
+#
+# Install:
+#   sudo useradd --system --home /opt/slam --shell /usr/sbin/nologin slam
+#   sudo mkdir -p /opt/slam && sudo cp -r . /opt/slam
+#   cd /opt/slam && sudo python3 -m venv .venv
+#   sudo ./.venv/bin/pip install -r requirements.txt
+#   sudo cp deploy/slam.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now slam
+#
+# Logs:  journalctl -u slam -f
+
+[Unit]
+Description=Monocular sparse point-cloud SLAM
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=slam
+Group=slam
+WorkingDirectory=/opt/slam
+
+# Settings live here so they can be changed without touching the unit, and so
+# the measurement sweep can drive them. /health echoes whatever is in force.
+EnvironmentFile=-/etc/slam.env
+
+# ONE worker. Two reasons, and both are load-bearing:
+#
+#  1. Job state is an in-process dictionary. A second worker would accept
+#     uploads it cannot then report progress on, because the job lives in the
+#     other process's memory. The client would poll and get a 404.
+#
+#  2. The box has 2 vCPUs and this workload stops scaling past 2 threads
+#     (measured: 1 thread 29.9 ms/frame, 2 threads 17.7, 8 threads 19.2).
+#     A second worker would not make anything faster; it would make two jobs
+#     miss the 10-second budget instead of one job meeting it.
+ExecStart=/opt/slam/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+
+Restart=on-failure
+RestartSec=5
+# A job is ~10 seconds. Give an in-flight one time to finish before SIGKILL.
+TimeoutStopSec=30
+
+# --- Hardening. Each line removes something this app demonstrably never uses.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Uploads spool to a private tmpdir; nothing else is written outside it.
+StateDirectory=slam
+ReadWritePaths=/var/lib/slam
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Listens on TCP and makes no outbound connections at all -- there is no model
+# server, no API, nothing to call.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

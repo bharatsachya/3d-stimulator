@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monocular sparse SLAM</title>
+<link rel="stylesheet" href="style.css">
+
+<!--
+  Import map, not a bundler.
+
+  OrbitControls.js imports from the bare specifier 'three', which a browser
+  cannot resolve on its own. An import map points that name at the vendored
+  file. This is what lets the project keep its "no build step" rule while still
+  using the upstream files completely unmodified -- which in turn means the
+  vendored copies can be diffed against the real three.js release to prove
+  nothing was tampered with.
+-->
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/controls/OrbitControls.js": "./vendor/OrbitControls.js"
+  }
+}
+</script>
+</head>
+<body>
+
+<header>
+  <h1>Monocular sparse SLAM</h1>
+  <p class="sub">
+    Upload a video. Get the estimated camera trajectory and a sparse 3D point
+    cloud, with measured per-stage timings.
+  </p>
+</header>
+
+<main>
+  <!-- ---------- Upload ---------- -->
+  <section id="upload-panel" class="panel">
+    <div id="dropzone" tabindex="0" role="button"
+         aria-label="Choose a video or drop one here">
+      <input type="file" id="file-input" accept="video/*" hidden>
+      <div class="dz-inner">
+        <strong>Drop a video here</strong>
+        <span>or click to choose one</span>
+      </div>
+    </div>
+
+    <ul class="hints">
+      <li>Up to <strong>25&nbsp;MB</strong> and <strong>30&nbsp;seconds</strong>. Short clips work best.</li>
+      <li>Walk <em>sideways</em> past the subject. Turning on the spot gives a
+          single lens no depth to work with.</li>
+      <li>Textured surfaces reconstruct well. Blank walls do not.</li>
+    </ul>
+  </section>
+
+  <!-- ---------- Progress ---------- -->
+  <section id="progress-panel" class="panel" hidden>
+    <div class="row">
+      <span id="progress-stage">starting</span>
+      <span id="progress-count"></span>
+    </div>
+    <div class="bar"><div id="progress-fill"></div></div>
+    <p class="muted" id="progress-file"></p>
+  </section>
+
+  <!-- ---------- Failure ---------- -->
+  <section id="error-panel" class="panel error" hidden>
+    <h2 id="error-title">Could not reconstruct this video</h2>
+    <p id="error-message"></p>
+    <p class="muted" id="error-detail"></p>
+    <button class="again" data-action="reset">Try another video</button>
+  </section>
+
+  <!-- ---------- Result ---------- -->
+  <section id="result-panel" hidden>
+    <div class="panel viewer-panel">
+      <div id="viewer"></div>
+      <div class="viewer-legend">
+        <span><i class="swatch traj"></i>camera path</span>
+        <span><i class="swatch kf"></i>keyframes</span>
+        <span><i class="swatch pts"></i>map points</span>
+        <span class="muted">drag to orbit &middot; scroll to zoom</span>
+      </div>
+      <p class="units-note">
+        Axes are in <strong>arbitrary units</strong>. A single lens cannot
+        observe scale, so the reconstruction is correct only up to an unknown
+        scale factor. There is no metre here to report.
+      </p>
+    </div>
+
+    <div class="panel">
+      <h2>Reconstruction</h2>
+      <dl class="stats" id="stats"></dl>
+      <div id="flags"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Processing time</h2>
+      <p class="muted" id="timing-headline"></p>
+      <div class="table-scroll">
+        <table id="timing-table">
+          <thead>
+            <tr><th>stage</th><th>total ms</th><th>calls</th>
+                <th>mean ms</th><th>ms/frame</th><th>% wall</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted small">
+        <strong>unaccounted</strong> is wall clock minus the sum of the measured
+        stages. It is shown so the breakdown cannot quietly omit time.
+      </p>
+      <button class="again" data-action="reset">Process another video</button>
+    </div>
+  </section>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
