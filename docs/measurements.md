@@ -63,6 +63,60 @@ therefore records `threads_requested` separately, and that is the field to quote
 
 ---
 
+## TUM RGB-D: real footage with real ground truth
+
+`tools/tum_to_video.py` converts a TUM sequence into an mp4 plus ground truth in
+our own format. It encodes to video deliberately rather than reading the PNG
+folder directly, so the benchmark travels the identical code path as a reviewer
+dragging a file onto the page — same decode cost, same container overhead.
+
+TUM supplies what neither phone footage nor the synthetic scene can supply
+together: real imagery with externally measured 100 Hz motion-capture poses.
+
+### `freiburg3_nostructure_notexture_far` — the low-texture failure mode
+
+This sequence is from TUM's *Testing and Debugging* category. It is a blank
+wall, deliberately constructed to defeat SLAM; ORB-SLAM2's paper reports failure
+on it. It is used here as the low-texture failure case CLAUDE.md requires, and
+**not** as a reconstruction benchmark.
+
+474 frames, 15.9s, 31.1 fps, 640x480.
+
+| measurement | value |
+|---|---|
+| ORB keypoints (1000 requested) | median **12** |
+| matches surviving the ratio test | median **4** |
+| frames 0 vs 30, after ratio test | **2** |
+| image standard deviation | 20.2 (near-uniform grey) |
+
+Initialization needs 50 essential-matrix inliers. There are four correspondences
+to work with. This cannot and must not produce a reconstruction — the required
+behaviour is a clear diagnosis, which is what `INITIALIZATION_FAILED` says.
+
+### A timing trap this sequence exposes
+
+The probe on this clip reports a **4.6 ms/frame** floor, against 18.1 ms/frame
+for the synthetic one. It is not faster in any useful sense: ORB costs 4.05
+ms/frame here versus 15.51 ms because there is nothing in the image to detect
+or describe.
+
+So per-frame cost is a function of scene content, not only of resolution and
+feature budget. **A single headline timing number would be misleading**, and the
+README has to quote the settings and the clip together, with the richly textured
+case as the honest worst case.
+
+### The intrinsics experiment this enables
+
+TUM publishes measured intrinsics: fr3 is fx=535.4, fy=539.2, cx=320.1, cy=247.6.
+Our heuristic guesses 0.9 x width = 576 for these 640x480 frames — **+7.6%**.
+
+Because ground truth exists, that guess can be costed rather than merely
+disclosed: run the same clip with measured K and with heuristic K, and report
+the difference in ATE. That turns "focal length is estimated, not measured" from
+a limitation paragraph into a measured quantity.
+
+---
+
 ## Still to measure
 
 - [ ] **The same probe on the EC2 `m7i-flex.large`.** This is the number that
