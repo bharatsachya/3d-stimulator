@@ -66,66 +66,28 @@ def _get_semaphore() -> asyncio.Semaphore:
     return _semaphore
 
 
-def _stub_pipeline(video_path: str, progress) -> tuple[SlamResult, dict]:
+def _run_slam(video_path: str, progress) -> tuple[SlamResult, dict, dict]:
     """
-    STAGE 0 PLACEHOLDER. Replaced by the real pipeline at stage 7.
+    Run the real pipeline.
 
-    It exists so the whole path -- upload, spool, 202, background task, polling,
-    progress, render -- can be deployed and proven end to end before any SLAM
-    code is written. If deployment is going to fail on a security group or a
-    missing wheel, it should fail today, not on the deadline.
-
-    It fabricates a small helix of poses and a ring of points so the viewer has
-    something to draw. The numbers are meaningless and the result is labelled
-    as a stub.
+    Imported inside the function rather than at module scope so that importing
+    `app.jobs` -- which the API does at startup -- does not pull in OpenCV,
+    NumPy and SciPy. That keeps the web layer's import graph independent of the
+    algorithm's, which is the same separation vslam/ maintains by never
+    importing FastAPI.
     """
-    import math
+    from vslam.export import to_slam_result
+    from vslam.pipeline import run_pipeline
 
-    total = 40
-    poses, frame_indices, points, observations = [], [], [], []
-
-    for i in range(total):
-        progress("stub", i, total)
-        time.sleep(0.02)  # stand in for per-frame work
-
-        angle = i * 0.15
-        # 4x4 camera-to-world. Y-up already, as the real export will be.
-        pose = [
-            [math.cos(angle), 0.0, math.sin(angle), math.sin(angle) * 2.0],
-            [0.0, 1.0, 0.0, i * 0.02],
-            [-math.sin(angle), 0.0, math.cos(angle), math.cos(angle) * 2.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ]
-        poses.append(pose)
-        frame_indices.append(i * 3)
-
-    for i in range(300):
-        angle = i * 0.21
-        radius = 3.0 + (i % 7) * 0.1
-        points.append(
-            [math.cos(angle) * radius, (i % 40) * 0.05 - 1.0, math.sin(angle) * radius]
-        )
-        observations.append(2 + (i % 5))
-
-    result = SlamResult(
-        poses=poses,
-        frame_indices=frame_indices,
-        keyframe_indices=list(range(0, total, 5)),
-        points=points,
-        observations=observations,
-        flags=[],
-        flag_messages=["STUB RESULT - the SLAM pipeline is not wired in yet."],
+    result = run_pipeline(
+        video_path,
+        processed_fps=settings.processed_fps,
+        working_width=settings.working_width,
+        n_features=settings.n_features,
+        max_duration_seconds=settings.max_duration_seconds,
+        progress=progress,
     )
-    timing = {
-        "wall_ms": 800.0,
-        "frames": total,
-        "ms_per_frame": 20.0,
-        "stages": [],
-        "unaccounted_ms": 0.0,
-        "unaccounted_pct": 0.0,
-        "stub": True,
-    }
-    return result, timing
+    return to_slam_result(result), result.timing, result.stats
 
 
 async def run_job(job_id: str, video: SpooledVideo, job_dir: str) -> None:
@@ -156,9 +118,12 @@ async def run_job(job_id: str, video: SpooledVideo, job_dir: str) -> None:
                     store.set_progress(job_id, stage, done, total), loop
                 )
 
-            result, timing = await asyncio.to_thread(
-                _stub_pipeline, video.path, progress
+            result, timing, stats = await asyncio.to_thread(
+                _run_slam, video.path, progress
             )
+            # The reconstruction statistics travel with the timing block, so the
+            # results page can show what was measured alongside how long it took.
+            timing = {**timing, "stats": stats}
             await store.finish(job_id, result, timing)
 
     except SlamFailure as failure:
