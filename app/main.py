@@ -11,8 +11,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import Response
 
 from app.config import settings
 from app.jobs import schedule_job
@@ -118,9 +119,29 @@ async def get_job(job_id: str, summary: bool = False) -> dict:
     return job.summary() if summary else job.to_dict()
 
 
+class AppStatic(StaticFiles):
+    """
+    Static files with cache headers chosen per file rather than globally.
+
+    The vendored Three.js build is 600 KB and changes only when the library is
+    deliberately upgraded, so it should be cached hard. Our own HTML, CSS and JS
+    change on every deploy, and a cached copy of those is actively harmful: you
+    fix a bug, redeploy, and the browser serves the old file, so the fix looks
+    like it did not work. That wastes far more time than the bytes are worth.
+    """
+
+    async def get_response(self, path: str, scope) -> Response:
+        response = await super().get_response(path, scope)
+        if path.startswith("vendor/"):
+            response.headers["Cache-Control"] = "public, max-age=604800, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-store, must-revalidate"
+        return response
+
+
 # The frontend. Mounted last so it cannot shadow an /api route.
 #
 # html=True makes StaticFiles serve index.html at the mount root, which is why
 # there is no hand-written route for "/".
 if STATIC_DIR.is_dir():
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+    app.mount("/", AppStatic(directory=STATIC_DIR, html=True), name="static")

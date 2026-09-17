@@ -38,14 +38,29 @@
 <main>
   <!-- ---------- Upload ---------- -->
   <section id="upload-panel" class="panel">
-    <div id="dropzone" tabindex="0" role="button"
-         aria-label="Choose a video or drop one here">
-      <input type="file" id="file-input" accept="video/*" hidden>
+    <!--
+      A LABEL, not a div with a click handler.
+
+      The first version nested the <input> inside a <div id="dropzone"> whose
+      click handler called fileInput.click(). That click event bubbles back up
+      to the dropzone, which calls fileInput.click() again -- unbounded
+      recursion. The browser suppresses it and the file picker simply never
+      opens, with nothing in the console to explain why.
+
+      A label bound to the input by `for` gets this natively: clicking or
+      keyboard-activating it opens the picker with no JavaScript involved, and
+      screen readers announce the association without an aria-label.
+
+      The input is visually hidden rather than `hidden`, because a `hidden`
+      input cannot receive keyboard focus.
+    -->
+    <input type="file" id="file-input" accept="video/*" class="visually-hidden">
+    <label id="dropzone" for="file-input">
       <div class="dz-inner">
         <strong>Drop a video here</strong>
         <span>or click to choose one</span>
       </div>
-    </div>
+    </label>
 
     <ul class="hints">
       <li>Up to <strong>25&nbsp;MB</strong> and <strong>30&nbsp;seconds</strong>. Short clips work best.</li>

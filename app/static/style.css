@@ -42,7 +42,20 @@ main { max-width: 900px; margin: 0 auto; display: grid; gap: 1rem; }
 
 /* ---------- Upload ---------- */
 
+/* Visually hidden but still focusable and still announced by screen readers.
+   `display: none` or the `hidden` attribute would remove it from the tab order,
+   which would make the upload control keyboard-unreachable. */
+.visually-hidden {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0; border: 0;
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
 #dropzone {
+  display: block;
   border: 2px dashed var(--line);
   border-radius: var(--radius);
   padding: 2.5rem 1rem;
@@ -50,10 +63,11 @@ main { max-width: 900px; margin: 0 auto; display: grid; gap: 1rem; }
   cursor: pointer;
   transition: border-color .15s, background .15s;
 }
-#dropzone:hover, #dropzone:focus-visible, #dropzone.over {
+#dropzone:hover, #dropzone.over,
+/* The input is what receives focus, so the ring is drawn on its sibling label. */
+.visually-hidden:focus-visible + #dropzone {
   border-color: var(--accent);
   background: #1b2430;
-  outline: none;
 }
 .dz-inner { display: grid; gap: .3rem; }
 .dz-inner span { color: var(--muted); font-size: .9rem; }
@@ -125,3 +139,10 @@ button.again {
   padding: .5rem .9rem; font-size: .88rem; cursor: pointer;
 }
 button.again:hover { border-color: var(--accent); }
+
+/* Shown in place of the canvas when the 3D view cannot start. The numbers are
+   still on screen, so this is a degraded view rather than a failed job. */
+.viewer-failed {
+  margin: 0; padding: 2rem 1.25rem;
+  color: var(--muted); font-size: .88rem; text-align: center;
+}

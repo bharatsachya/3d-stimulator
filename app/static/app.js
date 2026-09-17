@@ -5,7 +5,24 @@
  * relative. There is no API base to configure and no CORS to think about.
  */
 
-import { renderReconstruction, disposeViewer } from './viewer.js';
+/*
+ * The viewer is loaded on demand rather than imported at the top.
+ *
+ * A static `import` of viewer.js would make the whole module -- upload, polling,
+ * error reporting, everything -- fail to execute if Three.js could not be
+ * resolved. An ES module that throws during evaluation runs NONE of its code,
+ * so a WebGL problem would silently disable the upload button, which is a
+ * miserable failure to diagnose.
+ *
+ * Loading it only when there is a result to draw means a broken viewer costs
+ * you the 3D view and nothing else.
+ */
+let viewer = null;
+
+async function loadViewer() {
+  if (!viewer) viewer = await import('./viewer.js');
+  return viewer;
+}
 
 const dropzone = document.getElementById('dropzone');
 const fileInput = document.getElementById('file-input');
@@ -26,13 +43,15 @@ function show(name) {
 
 // ---------------------------------------------------------------- upload
 
-dropzone.addEventListener('click', () => fileInput.click());
-dropzone.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter' || event.key === ' ') {
-    event.preventDefault();
-    fileInput.click();
-  }
-});
+/*
+ * There is deliberately NO click handler here. #dropzone is a <label for>, so
+ * the browser opens the file picker itself, for both mouse and keyboard.
+ *
+ * The previous version did attach one, to a div that CONTAINED the input, and
+ * called fileInput.click() from it. The synthetic click bubbled back to the
+ * div, which called fileInput.click() again, recursing until the browser gave
+ * up -- and the picker never opened, with nothing logged to explain it.
+ */
 fileInput.addEventListener('change', () => {
   if (fileInput.files.length) startJob(fileInput.files[0]);
 });
@@ -58,11 +77,27 @@ dropzone.addEventListener('drop', (event) => {
 
 for (const button of document.querySelectorAll('[data-action="reset"]')) {
   button.addEventListener('click', () => {
-    disposeViewer();
+    viewer?.disposeViewer();
+    // Clearing the value matters: without it, choosing the SAME file again
+    // fires no 'change' event and the page appears frozen.
     fileInput.value = '';
     show('upload');
   });
 }
+
+/*
+ * Surface anything that would otherwise fail silently.
+ *
+ * Module-level errors do not reach a try/catch anywhere in this file, and an
+ * uncaught promise rejection prints only to a console the user is not looking
+ * at. This turns both into something visible on the page.
+ */
+window.addEventListener('error', (event) => {
+  showError('Something went wrong in the page', event.message ?? String(event.error), '');
+});
+window.addEventListener('unhandledrejection', (event) => {
+  showError('Something went wrong in the page', String(event.reason), '');
+});
 
 async function startJob(file) {
   document.getElementById('progress-file').textContent =
@@ -154,14 +189,31 @@ function showError(title, message, detail) {
   show('error');
 }
 
-function showResult(job) {
+async function showResult(job) {
   const result = job.result;
   const timing = job.timing ?? {};
 
   show('result');
+
+  // Stats and timings first, so they appear even if the 3D view cannot.
+  renderStats(result);
+  renderTiming(timing);
+
   // Render only once the panel is visible: a hidden container has zero width,
   // and a WebGL canvas sized to zero stays zero until something forces a resize.
-  renderReconstruction(document.getElementById('viewer'), result);
+  try {
+    const { renderReconstruction } = await loadViewer();
+    renderReconstruction(document.getElementById('viewer'), result);
+  } catch (error) {
+    // A failed viewer must not discard a successful reconstruction. The numbers
+    // are already on screen; say what is missing and why.
+    document.getElementById('viewer').innerHTML =
+      `<p class="viewer-failed">3D view unavailable: ${escapeHtml(String(error))}<br>`
+      + `The reconstruction itself succeeded — see the figures below.</p>`;
+  }
+}
+
+function renderStats(result) {
 
   const stats = [
     ['camera poses', result.n_poses],
@@ -177,8 +229,6 @@ function showResult(job) {
   flags.innerHTML = (result.flag_messages ?? [])
     .map((message) => `<div class="flag">${escapeHtml(message)}</div>`)
     .join('');
-
-  renderTiming(timing);
 }
 
 function renderTiming(timing) {
