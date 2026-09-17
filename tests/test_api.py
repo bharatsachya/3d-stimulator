@@ -18,13 +18,14 @@ So the split here is deliberate:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
-from app.schema import JobStatus
+from app.schema import FailureReason, JobStatus
 from app.store import store
 from app.uploads import SpooledVideo
 from app import jobs
@@ -91,21 +92,62 @@ def test_job_ids_are_unique_and_unguessable(client: TestClient) -> None:
     assert len(ids) == 5
 
 
-def test_worker_completes_a_job() -> None:
-    """Drive the worker directly -- see the module docstring for why."""
+def test_undecodable_video_fails_with_a_typed_reason() -> None:
+    """
+    A file that is not a video must produce a diagnosed failure, never a 500
+    and never a crashed background task.
+
+    This test previously asserted that the same input SUCCEEDED, because the
+    stage-0 stub never opened the file. Wiring up the real pipeline correctly
+    broke it -- which is the test doing its job.
+    """
 
     async def run() -> None:
-        job = await store.create("clip.mp4", 2048)
+        job = await store.create("not-a-video.mp4", 2048)
         await jobs.run_job(
             job.id,
-            SpooledVideo(path="/dev/null", display_name="clip.mp4", size_bytes=2048),
+            SpooledVideo(
+                path="/dev/null", display_name="not-a-video.mp4", size_bytes=2048
+            ),
             "/tmp/slam-test-dir-that-does-not-exist",
         )
         finished = await store.get(job.id)
         assert finished is not None
-        assert finished.status is JobStatus.DONE
+        assert finished.status is JobStatus.FAILED
+        # Diagnosed, not an internal error: we know exactly what went wrong.
+        assert finished.failure_reason is FailureReason.DECODE_FAILED
+        # And the user gets a sentence, not a traceback.
+        assert finished.summary()["failure_message"]
+
+    asyncio.run(asyncio.wait_for(run(), timeout=60))
+
+
+@pytest.mark.skipif(
+    not (Path(__file__).resolve().parent.parent / "samples" / "synth_dolly.mp4").is_file(),
+    reason="sample clips are generated, not committed; run tools/make_synthetic.py",
+)
+def test_worker_reconstructs_a_real_clip() -> None:
+    """End to end on a real video, driving the worker directly."""
+    sample = Path(__file__).resolve().parent.parent / "samples" / "synth_dolly.mp4"
+
+    async def run() -> None:
+        job = await store.create(sample.name, sample.stat().st_size)
+        await jobs.run_job(
+            job.id,
+            SpooledVideo(
+                path=str(sample), display_name=sample.name, size_bytes=sample.stat().st_size
+            ),
+            "/tmp/slam-test-dir-that-does-not-exist",
+        )
+        finished = await store.get(job.id)
+        assert finished is not None, "job vanished"
+        assert finished.status is JobStatus.DONE, finished.failure_detail
         assert finished.result is not None
+        assert len(finished.result.poses) > 20
+        assert len(finished.result.points) > 100
         # A finished job must not display 97%.
         assert finished.frames_done == finished.frames_total
+        # Units are never metres, whatever else changes.
+        assert finished.result.to_dict()["units"] == "arbitrary"
 
-    asyncio.run(asyncio.wait_for(run(), timeout=30))
+    asyncio.run(asyncio.wait_for(run(), timeout=180))
