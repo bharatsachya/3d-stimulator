@@ -188,17 +188,17 @@ def run_pipeline(
                     LOCAL_MAP_KEYFRAMES
                 )
 
-            with timer.stage("pnp"):
-                tracked = track_frame(
-                    features,
-                    descriptors,
-                    positions,
-                    point_ids,
-                    matcher,
-                    camera,
-                    previous_R,
-                    previous_t,
-                )
+            tracked = track_frame(
+                features,
+                descriptors,
+                positions,
+                point_ids,
+                matcher,
+                camera,
+                previous_R,
+                previous_t,
+                timer=timer,
+            )
 
             if not tracked.success:
                 # CLAUDE.md: stop, return the partial trajectory, flag it. No

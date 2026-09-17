@@ -72,6 +72,7 @@ def track_frame(
     camera: Camera,
     previous_R: np.ndarray | None = None,
     previous_t: np.ndarray | None = None,
+    timer=None,
 ) -> TrackingResult:
     """
     Estimate this frame's pose from the local map.
@@ -79,7 +80,15 @@ def track_frame(
     `previous_R`/`previous_t` seed the solver with the last known pose. Frames
     are 100 ms apart, so the camera has barely moved, and starting from the
     previous pose converges faster and more reliably than starting from nothing.
+
+    `timer` separates the descriptor matching from the PnP solve. They are two
+    very different costs -- matching is brute-force and quadratic in descriptor
+    counts, PnP is a small iterative solve -- and reporting them as one number
+    would tell the reader nothing about which to tune.
     """
+    from contextlib import nullcontext
+
+    stage = timer.stage if timer is not None else (lambda _name: nullcontext())
     if features.descriptors is None or len(map_descriptors) < 4:
         return TrackingResult(
             success=False, reason="no descriptors or too few map points"
@@ -87,9 +96,10 @@ def track_frame(
 
     # Query = frame features, train = map points, so indices come back as
     # (feature index, map point index).
-    feature_indices, map_indices = matcher.match(
-        features.descriptors, map_descriptors
-    )
+    with stage("match_map"):
+        feature_indices, map_indices = matcher.match(
+            features.descriptors, map_descriptors
+        )
     n_matches = len(feature_indices)
 
     # PnP needs at least 4 points; below MIN_TRACKING_INLIERS there is no
@@ -108,19 +118,20 @@ def track_frame(
     rvec = cv2.Rodrigues(previous_R)[0] if use_guess else None
     tvec = previous_t.reshape(3, 1).copy() if use_guess else None
 
-    success, rvec, tvec, inliers = cv2.solvePnPRansac(
-        object_points,
-        image_points,
-        camera.matrix,
-        None,                      # no distortion coefficients; see camera.py
-        rvec=rvec,
-        tvec=tvec,
-        useExtrinsicGuess=use_guess,
-        iterationsCount=PNP_ITERATIONS,
-        reprojectionError=REPROJECTION_THRESHOLD_PX,
-        confidence=PNP_CONFIDENCE,
-        flags=cv2.SOLVEPNP_ITERATIVE,
-    )
+    with stage("pnp"):
+        success, rvec, tvec, inliers = cv2.solvePnPRansac(
+            object_points,
+            image_points,
+            camera.matrix,
+            None,                  # no distortion coefficients; see camera.py
+            rvec=rvec,
+            tvec=tvec,
+            useExtrinsicGuess=use_guess,
+            iterationsCount=PNP_ITERATIONS,
+            reprojectionError=REPROJECTION_THRESHOLD_PX,
+            confidence=PNP_CONFIDENCE,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
 
     if not success or inliers is None:
         return TrackingResult(
