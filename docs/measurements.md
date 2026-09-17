@@ -115,10 +115,73 @@ disclosed: run the same clip with measured K and with heuristic K, and report
 the difference in ATE. That turns "focal length is estimated, not measured" from
 a limitation paragraph into a measured quantity.
 
+### `freiburg1_xyz` — the reconstruction benchmark
+
+The counterpart to the blank wall: a textured desk with the camera translating
+along each axis in turn. TUM's standard easy case, chosen as the smallest
+download (427 MB) that actually reconstructs.
+
+798 frames, 25.6 s, 31.2 fps, 640x480 → 16.6 MB as mp4, which fits under the
+25 MB upload cap and the 30 s duration limit. It can be dropped onto the
+deployed page exactly as a reviewer would.
+
+| clip | ORB keypoints | matches after ratio test | floor ms/frame |
+|---|---|---|---|
+| `synth_dolly` (synthetic) | 1000 | 628 | 18.1 |
+| `tum_fr1_xyz` (real) | 1000 | 546 | **11.5** |
+| `tum_nostructure_notexture` (blank wall) | 12 | 4 | 4.6 |
+
+Real footage sits between the synthetic scene and the degenerate one, which is
+the ordering you would want: the synthetic texture is denser than reality, and
+the blank wall has nothing to find.
+
+### Two-view geometry on real data, measured vs heuristic intrinsics
+
+Frame 0 against increasing gaps, essential matrix + `recoverPose`, compared to
+100 Hz motion capture. Baselines are the true metric distance between camera
+centres. Both intrinsic sets were run on identical correspondences.
+
+| gap | baseline (m) | inliers | measured K rot° / t-dir° | heuristic K rot° / t-dir° |
+|---|---|---|---|---|
+| 3 | 0.037 | 531 | 0.80 / 12.4 | 0.89 / 11.2 |
+| 6 | 0.072 | 456 | 0.44 / 8.8 | 0.44 / 8.5 |
+| 15 | 0.181 | 344 | 6.01 / 32.1 | 0.69 / 9.4 |
+| **30** | **0.354** | 156 | **1.47 / 1.75** | 2.09 / 2.80 |
+| 60 | 0.103 | 348 | 1.52 / 21.7 | 1.12 / 21.5 |
+| 90 | 0.048 | 137 | 1.73 / 35.2 | 1.96 / 63.9 |
+| 150 | 0.096 | 317 | 0.58 / 9.4 | 3.83 / 39.6 |
+| 240 | 0.157 | 162 | 0.69 / 5.5 | 1.88 / 6.2 |
+
+Two things to take from this, and one thing not to.
+
+**Baseline dominates everything.** The best result by a wide margin is the row
+with the longest baseline (0.354 m → 1.75° translation error); the worst are the
+rows where the camera happened to return near its starting point, so a large
+frame gap still means a tiny baseline. That is the whole justification for the
+minimum-parallax gate at initialization: frame distance is not baseline, and
+choosing an initialization pair by frame index alone would frequently pick a
+degenerate pair.
+
+**An 11.3% focal error does not dominate at this stage.** The heuristic
+(0.9 x width = 576) against fr1's measured fx = 517.3 wins some rows and loses
+others, all inside the two-view noise. That is worth knowing but not yet worth
+concluding from — two-view estimates on short baselines are noisy, and the
+question that matters is what the error does to a full trajectory after
+map-based tracking and bundle adjustment. Measure it there.
+
+**Do not read these as pipeline accuracy.** They are raw two-view estimates
+with no map, no PnP and no BA — the floor the real pipeline should beat, not a
+result.
+
 ---
 
 ## Still to measure
 
+- [ ] **ATE for the full pipeline on `tum_fr1_xyz`**, Sim(3)-aligned. The
+      machinery is built and unit-tested (`vslam/align.py`); it needs a
+      trajectory to evaluate.
+- [ ] **Cost of the focal-length heuristic**, measured as the ATE difference
+      between measured K and 0.9 x width on the same clip.
 - [ ] **The same probe on the EC2 `m7i-flex.large`.** This is the number that
       counts; everything above is shape-finding. Expect single-core speed, not
       core count, to drive the difference.
