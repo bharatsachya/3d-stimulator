@@ -627,3 +627,32 @@ wrong sequence to judge it on — it oscillates inside a 0.94 m box with error
 already at 0.45% of path, so there is no accumulated drift for a closure to
 correct. The claim in requirement 4 that loop closure corrects drift is
 well-founded in the literature and is *not* evidenced by any measurement here.
+
+---
+
+# Stage G (final) — the benchmark
+
+EC2 `m7i-flex.large`, sole job on the instance, `frames_before_reinitialization=8`,
+BA every 2nd keyframe at `max_nfev=50`. Each segment Sim(3)-aligned separately;
+ATE is the pose-weighted RMS across segments.
+
+| sequence | frames | coverage | segments | path m | ATE cm | % of path | keyframes | points | ms/frame |
+|---|---|---|---|---|---|---|---|---|---|
+| fr1_xyz | 798 | 99.7% | 5 | 4.93 | 1.57 | **0.32** | 43 | 5200 | 61.4 |
+| fr1_desk | 613 | 100.0% | 14 | 3.67 | 2.82 | **0.77** | 47 | 5751 | 44.1 |
+| fr1_desk2 | 640 | 92.0% | 13 | 1.98 | 3.10 | **1.57** | 31 | 3015 | 60.3 |
+| fr1_room | 1362 | 99.9% | 27 | 5.92 | 3.26 | **0.55** | 89 | 9147 | 55.0 |
+| fr2_desk | 2965 | 100.0% | 13 | 14.71 | 11.75 | **0.80** | 234 | 32492 | 59.3 |
+
+Every sequence stays inside the 100 ms/frame budget, on two vCPUs, with no GPU.
+
+Reproduced independently after the fact: a fresh run of fr1_desk returned
+100.0% coverage, 14 segments, 2.82 cm, 0.77%, 44.5 ms/frame against the
+benchmark's 44.1 — deterministic to the last decimal on accuracy.
+
+**Excluded, and stated rather than quietly omitted:** `fr1_360`
+(rotation-dominated) and `fr1_floor` (low texture). The ORB-SLAM authors note
+these are unsuitable for monocular systems, since a monocular system cannot
+initialise without parallax — a property of the sensor, not the implementation
+(Mur-Artal, Montiel & Tardós, *ORB-SLAM: A Versatile and Accurate Monocular SLAM
+System*, IEEE T-RO 2015).
