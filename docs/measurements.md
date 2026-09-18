@@ -284,3 +284,140 @@ result.
 - [ ] The five-parameter sweep: processed fps, working resolution, features per
       frame, BA window size, BA frequency.
 - [ ] End-to-end wall clock for a 10s clip, which is what the brief actually asks.
+
+---
+
+# Stage A — diagnosing the frame-186 tracking loss
+
+Tracking died at frame 186 of 798 on TUM fr1_xyz, capping every accuracy figure
+at 23% coverage. Four hypotheses were proposed and the pipeline was instrumented
+per frame (`tools/diagnose.py`) rather than fixed speculatively.
+
+| hypothesis | verdict | evidence |
+|---|---|---|
+| H1 cull outpacing triangulation | **refuted** | **0 points culled in the entire run**; 1934 triangulated, 2121 in the map at the end |
+| H2 keyframes stop, camera exits the map | **refuted** | keyframe inserted 3 frames before the failure; **1596 points still projecting into view** |
+| H3 viewpoint change breaks matching | **supported** | map healthy and in view, match rate collapses from 20-25% of visible points to **5.0%** |
+| H4 min-30-inliers too strict | contributory only | inliers fall 246 → 87 → 52 → 44 → 24; relaxing the threshold buys about one frame of a cliff |
+
+Not motion blur: Laplacian variance at the failing frames (196-236) is *higher*
+than forty frames earlier (159-220), and ORB still returns its full 1000
+features. Ground truth shows the camera accelerating from 0.008 m per step
+(frames 162-171) to 0.038-0.041 m per step from 174 onward, and the frames show
+a second monitor entering from the right. The scene genuinely changes.
+
+## What was tried and did not work
+
+**Projection-guided matching: implemented, measured, rejected.**
+
+In isolation it looked decisive. At the exact failing frame, with the TRUE pose:
+
+| search | matches |
+|---|---|
+| global brute force over 1464 map descriptors | 90 |
+| projection-guided, 8 px radius | **203** |
+| projection-guided, 40 px radius | 180 |
+| projection-guided, 80 px radius | 162 |
+
+End to end in the pipeline, using a *predicted* pose, it was consistently worse:
+
+| config | poses | last frame | ATE cm | ms/frame |
+|---|---|---|---|---|
+| brute force | **59** | **180** | 1.67 | 43.7 |
+| projection r=30, ratio 0.75 | 8 | 27 | 0.79 | 21.6 |
+| projection r=30, no ratio | 23 | 72 | 0.99 | 25.4 |
+| projection r=60, no ratio | 23 | 72 | 1.05 | 26.9 |
+| projection r=100, no ratio | 23 | 72 | 1.03 | 25.2 |
+
+Three things this exposed, each worth more than the feature would have been:
+
+1. **The isolated test used the true pose; the pipeline only has a predicted
+   one.** Constant-velocity prediction error was measured at a median of 8-23 px,
+   p90 up to 31 px, and a maximum of 165 px, so correct matches routinely fell
+   outside the search disc.
+2. **Radius was never the live variable.** r=30, 60 and 100 give *identical*
+   results, because the `k=8` nearest-neighbour cap binds before the radius does.
+3. **The raw match counts were never comparable.** The local window held 217 map
+   points while brute force reported 238 matches — it assigns several frame
+   keypoints to the same map point, while the projection matcher enforces
+   one-to-one.
+
+Kept in the code behind a flag, defaulted off, because the mechanism is sound
+and would likely win with a better motion model. Shipping it on this evidence
+would not be.
+
+**Denser keyframes and a larger local map: measured, no material change.**
+
+| config | poses | last frame | ATE cm |
+|---|---|---|---|
+| baseline (3 frames / 10% depth / 0.70 ratio, window 8) | 59 | 180 | 1.67 |
+| translation trigger 10% → 5% | 59 | 180 | 1.48 |
+| translation trigger 10% → 3% | 61 | 186 | 2.00 |
+| tracked-ratio trigger 0.70 → 0.85 | 59 | 180 | 1.87 |
+| minimum keyframe gap 3 → 2 | 62 | 189 | 1.76 |
+| local window 8 → 16 | 59 | 180 | 1.59 |
+
+Every configuration still dies between frames 180 and 189. The loss is not a
+tuning problem.
+
+---
+
+# Stage B — the cull
+
+`cull` was the third-largest cost in the pipeline at 4.71 ms/frame, 17% of the
+budget. Sweeping its threshold showed something better than a speed problem:
+
+| max error px | culled | map points | ATE cm | ms/frame |
+|---|---|---|---|---|
+| **5.0 (shipped default)** | **0** | 1827 | 1.67 | 33.3 |
+| disabled entirely | 0 | 1827 | 1.67 | 32.2 |
+| 3.0 | 8 | 1880 | 1.67 | 22.4 |
+| 1.0 | 1028 | 1601 | 1.79 | 24.8 |
+| 0.5 | 2329 | 547 | 1.65 | 17.8 |
+| 5.0, min observations 3 | 3104 | 93 | 2.56 | 17.9 |
+
+**At its shipped threshold the cull removed zero points and was byte-identical
+to disabling it.** The reason is structural rather than accidental: triangulation
+only admits points whose reprojection error is already below 4 px, so a 5 px cull
+cannot fire on anything triangulation let through. It becomes meaningful only
+once bundle adjustment starts moving points after creation.
+
+The scan was also O(whole map) on every keyframe. Restricting it to points
+observed by recent keyframes:
+
+| cull scope | ATE cm | cull ms/frame | total ms/frame |
+|---|---|---|---|
+| whole map | 1.67 | 7.26 | 45.9 |
+| local window of 8 keyframes | 1.67 | **5.32** | **25.9** |
+
+Identical accuracy, 27% less cull cost. The threshold itself is deliberately
+**not** retuned here: 0.5 px looks best on this clip, and fitting a threshold to
+one sequence is the error this project has avoided elsewhere. It is revisited
+across the full benchmark once bundle adjustment gives it something to do.
+
+---
+
+# Stage D1 — surviving tracking loss
+
+Stage A established that the loss is the camera exploring, not a defect to be
+prevented. So the pipeline stopped terminating on a failed frame: it skips the
+frame without emitting a pose, keeps the map, and tries the next one. A full
+relocalization against the entire map runs as a second line of defence.
+
+| variant | poses | coverage | reloc | skipped | path m | ATE cm | % of path | ms/frame |
+|---|---|---|---|---|---|---|---|---|
+| terminate on first loss | 59 | 22.7% | 0 | 0 | 1.941 | 1.67 | 0.86 | 31.9 |
+| **skip + relocalize** | **234** | **99.7%** | 0 | 30 | **7.069** | 3.59 | **0.51** | 24.4 |
+| skip only, relocalize ablated | 234 | 99.7% | 0 | 30 | 7.069 | 3.59 | 0.51 | 24.1 |
+
+Coverage goes from 23% of the sequence to **99.7%**, over 3.6x the ground-truth
+path. Absolute ATE rises from 1.67 cm to 3.59 cm, which is expected over a much
+longer trajectory — but error **as a fraction of path length improves**, from
+0.86% to 0.51%.
+
+**An honest note on what did the work.** `relocalize()` never once succeeded on
+this sequence; the ablation row proves it, being identical to the row above it.
+The entire gain comes from the far simpler change of not giving up after a
+single failed frame. Relocalization is retained because it should matter on
+sequences where the camera is lost for longer, but **it is unvalidated and is
+not what produced this result.**

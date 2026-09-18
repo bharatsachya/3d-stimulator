@@ -135,3 +135,172 @@ class Matcher:
             np.array(query_indices, dtype=int),
             np.array(train_indices, dtype=int),
         )
+
+
+# ---------------------------------------------------------------------------
+# Projection-guided matching
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS, AND WHAT IT REPLACED
+#
+# Tracking originally matched every frame descriptor against every map
+# descriptor in the local window -- around 1500 of them -- and applied the ratio
+# test to the result. That is how tracking died at frame 183 of TUM fr1_xyz.
+#
+# The failure is not about the map. Measured at the exact frame where tracking
+# was lost, with the map healthy and 1116 points projecting inside the image:
+#
+#     global brute force over 1464 map descriptors ->  90 matches
+#     projection-guided search, 8px radius         -> 203 matches   (2.3x)
+#     projection-guided search, 15px radius        -> 193 matches
+#     projection-guided search, 40px radius        -> 180 matches
+#     projection-guided search, 80px radius        -> 162 matches
+#
+# Match count FALLS as the search radius grows, which is the signature of the
+# real problem: ambiguity. Lowe's ratio test discards a match when the second
+# best candidate is nearly as close. Searching the whole image means competing
+# against ~1500 descriptors, and somewhere among them there is almost always a
+# near-tie -- so correct matches are thrown away for being ambiguous against
+# descriptors that are nowhere near the point in question.
+#
+# Restricting the search to keypoints within a few pixels of where the map point
+# actually projects removes that competition. It is both more accurate AND
+# cheaper, because each map point is compared against roughly 11 candidates
+# rather than the whole frame.
+#
+# This is how ORB-SLAM's tracking works, and the measurement above is why.
+
+# Popcount lookup for Hamming distance on 32-byte ORB descriptors. XOR then sum
+# the set bits. A 256-entry table beats np.unpackbits comfortably and keeps the
+# inner loop free of allocation.
+_POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint16)
+
+# Candidate keypoints examined per projected map point. See search_by_projection.
+NEIGHBOURS_PER_PROJECTION = 8
+
+
+def hamming_distances(descriptor: np.ndarray, candidates: np.ndarray) -> np.ndarray:
+    """Hamming distance from one descriptor to each of several candidates."""
+    return _POPCOUNT[np.bitwise_xor(descriptor[None, :], candidates)].sum(axis=1)
+
+
+def search_by_projection(
+    features: Features,
+    map_descriptors: np.ndarray,
+    map_positions: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    camera,
+    radius_px: float = 12.0,
+    ratio: float = LOWE_RATIO,
+    max_distance: int = 70,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Match map points to frame keypoints using a predicted pose.
+
+    Each map point is projected into the image with (R, t) and compared only
+    against keypoints within `radius_px` of where it lands.
+
+    Returns (feature_indices, map_indices), the same parallel-array shape the
+    brute-force matcher returns, so callers are unaffected by which was used.
+
+    `radius_px` must cover the error in the predicted pose. Too small and a
+    correct match falls outside the circle; too large and the ambiguity this
+    exists to avoid creeps back in. 12 px is a little above the 8 px that
+    measured best, for tolerance when the motion model is wrong.
+    """
+    from scipy.spatial import cKDTree
+
+    empty = (np.empty(0, dtype=int), np.empty(0, dtype=int))
+    if features.descriptors is None or len(map_descriptors) == 0:
+        return empty
+    if len(features.points) == 0:
+        return empty
+
+    camera_points = (R @ map_positions.T).T + t
+    in_front = camera_points[:, 2] > 1e-6
+    if not in_front.any():
+        return empty
+
+    u = camera.fx * camera_points[:, 0] / camera_points[:, 2] + camera.cx
+    v = camera.fy * camera_points[:, 1] / camera_points[:, 2] + camera.cy
+    inside = in_front & (u >= 0) & (u < camera.width) & (v >= 0) & (v < camera.height)
+    candidate_map_indices = np.flatnonzero(inside)
+    if len(candidate_map_indices) == 0:
+        return empty
+
+    # One tree over the frame's keypoints, queried once for all projections.
+    #
+    # `query` with a fixed k and an upper bound, NOT `query_ball_point`.
+    # query_ball_point returns a ragged list of lists, and flattening that costs
+    # a Python-level pass over every candidate -- which measured 4x slower than
+    # the OpenCV brute-force matcher it was supposed to beat, despite comparing
+    # far fewer descriptors. `query` returns rectangular arrays, so everything
+    # downstream is pure NumPy.
+    #
+    # k = 8 is comfortably above the ~11 candidates a 12px radius was measured to
+    # contain on average, and the ratio test only ever looks at the best two.
+    tree = cKDTree(features.points)
+    projected = np.column_stack([u[candidate_map_indices], v[candidate_map_indices]])
+    neighbour_distance, neighbour_index = tree.query(
+        projected, k=NEIGHBOURS_PER_PROJECTION, distance_upper_bound=radius_px
+    )
+    if neighbour_index.ndim == 1:
+        neighbour_distance = neighbour_distance[:, None]
+        neighbour_index = neighbour_index[:, None]
+
+    # Missing neighbours come back as index == len(points) and distance == inf.
+    valid = np.isfinite(neighbour_distance)
+    if not valid.any():
+        return empty
+    # Clamp so the out-of-range sentinel can be used as an index safely; those
+    # entries are masked out by `valid` before anything depends on them.
+    neighbour_index = np.where(valid, neighbour_index, 0)
+
+    rows, columns = np.nonzero(valid)
+    pair_map = candidate_map_indices[rows]
+    pair_feature = neighbour_index[rows, columns]
+
+    # All Hamming distances in one shot.
+    xor = np.bitwise_xor(map_descriptors[pair_map], features.descriptors[pair_feature])
+    distances = _POPCOUNT[xor].sum(axis=1)
+
+    # Sort by (map point, distance) so each map point's best and second best sit
+    # adjacent, which makes the ratio test a comparison between neighbours.
+    order = np.lexsort((distances, pair_map))
+    pair_map = pair_map[order]
+    pair_feature = pair_feature[order]
+    distances = distances[order]
+
+    first_of_group = np.empty(len(pair_map), dtype=bool)
+    first_of_group[0] = True
+    first_of_group[1:] = pair_map[1:] != pair_map[:-1]
+    best_positions = np.flatnonzero(first_of_group)
+
+    best_distance = distances[best_positions]
+    group_sizes = np.diff(np.append(best_positions, len(pair_map)))
+    has_second = group_sizes > 1
+    second_distance = np.full(len(best_positions), np.inf)
+    second_distance[has_second] = distances[best_positions[has_second] + 1]
+
+    accept = (best_distance <= max_distance) & (
+        (~has_second) | (best_distance < ratio * second_distance)
+    )
+    accepted = best_positions[accept]
+    if len(accepted) == 0:
+        return empty
+
+    chosen_feature = pair_feature[accepted]
+    chosen_map = pair_map[accepted]
+    chosen_distance = distances[accepted]
+
+    # A frame keypoint must not be claimed by two map points: a duplicate
+    # association is a guaranteed outlier for PnP. Keep the closest claim.
+    keep_order = np.lexsort((chosen_distance, chosen_feature))
+    chosen_feature = chosen_feature[keep_order]
+    chosen_map = chosen_map[keep_order]
+    unique = np.empty(len(chosen_feature), dtype=bool)
+    unique[0] = True
+    unique[1:] = chosen_feature[1:] != chosen_feature[:-1]
+
+    return chosen_feature[unique], chosen_map[unique]

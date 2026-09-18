@@ -36,12 +36,52 @@ from vslam.features import FeatureExtractor, Matcher
 from vslam.initialize import SEARCH_WINDOW, initialize, try_initialize
 from vslam.mapping import Map, triangulate
 from vslam.timing import StageTimer
-from vslam.tracking import should_insert_keyframe, track_frame
+from vslam.tracking import relocalize, should_insert_keyframe, track_frame
 from vslam.video import iter_frames, probe_video
+
+def _pose_matrix(R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
+
+
+def predict_pose(
+    previous: tuple[np.ndarray, np.ndarray] | None,
+    current: tuple[np.ndarray, np.ndarray] | None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Constant-velocity prediction of where the camera will be next.
+
+    Projection-guided matching needs a pose BEFORE PnP has run, which is
+    circular unless the pose is predicted. Frames are 100 ms apart, so assuming
+    the motion between the last two frames repeats is a good approximation and
+    a standard one.
+
+    The prediction only has to be good enough to land the projection within the
+    search radius -- roughly 12 px. It is never used as an answer, only as a
+    hint, and PnP corrects whatever it gets wrong.
+
+    Falls back to the current pose (assume stationary) when there is no history,
+    which is still far better than no prediction at all.
+    """
+    if current is None:
+        return None
+    if previous is None:
+        return current
+
+    T_previous = _pose_matrix(*previous)
+    T_current = _pose_matrix(*current)
+    # Motion between the last two frames, applied again.
+    delta = T_current @ np.linalg.inv(T_previous)
+    predicted = delta @ T_current
+    return predicted[:3, :3], predicted[:3, 3]
+
 
 # How many recent keyframes supply the map points a frame is matched against.
 # Bounded so per-frame matching cost stays flat as the map grows.
 LOCAL_MAP_KEYFRAMES = 8
+
 # Applied when culling after each keyframe.
 MAX_MAP_POINT_ERROR_PX = 5.0
 MIN_OBSERVATIONS_TO_KEEP = 2
@@ -70,6 +110,29 @@ class PipelineResult:
     stats: dict = field(default_factory=dict)
 
 
+def _count_visible(world_map: Map, R: np.ndarray, t: np.ndarray, camera: Camera) -> int:
+    """
+    How many map points project inside the image from this pose.
+
+    Diagnostic only. It answers a question the match and inlier counts cannot:
+    whether the camera still has map in front of it at all. A healthy map that
+    the camera has walked out of looks identical, from the inlier count alone,
+    to a map that has been culled away -- and the two need opposite fixes.
+    """
+    if not world_map.points:
+        return 0
+    positions = np.array([p.position for p in world_map.points.values()])
+    cam = (R @ positions.T).T + t
+    in_front = cam[:, 2] > 1e-6
+    if not in_front.any():
+        return 0
+    projected = cam[in_front]
+    u = camera.fx * projected[:, 0] / projected[:, 2] + camera.cx
+    v = camera.fy * projected[:, 1] / projected[:, 2] + camera.cy
+    inside = (u >= 0) & (u < camera.width) & (v >= 0) & (v < camera.height)
+    return int(inside.sum())
+
+
 def run_pipeline(
     video_path: str,
     processed_fps: float = 10.0,
@@ -78,6 +141,19 @@ def run_pipeline(
     focal_px: float | None = None,
     max_duration_seconds: float | None = None,
     progress=None,
+    diagnostics: list | None = None,
+    # Projection-guided matching is OFF by default: measured worse than brute
+    # force on TUM fr1_xyz (23 poses against 59). See docs/measurements.md.
+    projection_radius_px: float = 0.0,
+    projection_ratio: float = 0.9,
+    local_map_keyframes: int = LOCAL_MAP_KEYFRAMES,
+    min_frames_between_keyframes: int = 3,
+    keyframe_translation_fraction: float = 0.10,
+    keyframe_tracked_ratio: float = 0.7,
+    max_map_point_error_px: float = MAX_MAP_POINT_ERROR_PX,
+    cull_window_keyframes: int = 8,
+    enable_relocalization: bool = True,
+    max_consecutive_lost_frames: int = 60,
 ) -> PipelineResult:
     timer = StageTimer()
     extractor = FeatureExtractor(n_features)
@@ -97,7 +173,13 @@ def run_pipeline(
     last_keyframe_id = 0
     frames_since_keyframe = 0
     previous_R = previous_t = None
+    # One further step of history, for the constant-velocity motion model.
+    older_R = older_t = None
     lost_at_frame: int | None = None
+    consecutive_lost = 0
+    relocalizations: list[dict] = []
+    lost_frames = 0
+    lost_since: int | None = None
 
     with timer.run():
         for processed_index, frame in enumerate(
@@ -185,9 +267,13 @@ def run_pipeline(
             # ------------------------------------------------------- track
             with timer.stage("local_map"):
                 descriptors, positions, point_ids = world_map.local_points(
-                    LOCAL_MAP_KEYFRAMES
+                    local_map_keyframes
                 )
 
+            predicted = predict_pose(
+                (older_R, older_t) if older_R is not None else None,
+                (previous_R, previous_t) if previous_R is not None else None,
+            )
             tracked = track_frame(
                 features,
                 descriptors,
@@ -198,20 +284,89 @@ def run_pipeline(
                 previous_R,
                 previous_t,
                 timer=timer,
+                predicted_R=predicted[0] if predicted else None,
+                predicted_t=predicted[1] if predicted else None,
+                projection_radius_px=projection_radius_px,
+                projection_ratio=projection_ratio,
             )
 
             if not tracked.success:
-                # CLAUDE.md: stop, return the partial trajectory, flag it. No
-                # relocalization -- that is explicitly out of scope.
-                lost_at_frame = frame.index
-                flags.append(ResultFlag.TRACKING_LOST.value)
-                break
+                if diagnostics is not None:
+                    # The failing frame is the most informative one in the run,
+                    # so record it before breaking out.
+                    diagnostics.append(
+                        {
+                            "frame_index": frame.index,
+                            "n_features": len(features),
+                            "n_map_points": world_map.n_points,
+                            "n_local_points": len(point_ids),
+                            "n_visible": _count_visible(
+                                world_map, previous_R, previous_t, camera
+                            ),
+                            "n_matches": tracked.n_matches,
+                            "n_inliers": tracked.n_inliers,
+                            "inlier_ratio": round(tracked.inlier_ratio, 4),
+                            "is_keyframe": False,
+                            "n_culled": 0,
+                            "n_triangulated": 0,
+                            "median_depth": 0.0,
+                            "translation_since_kf": 0.0,
+                            "n_keyframes": world_map.n_keyframes,
+                            "tracking_failed": True,
+                            "failure_reason": tracked.reason,
+                        }
+                    )
+                if not enable_relocalization:
+                    lost_at_frame = frame.index
+                    flags.append(ResultFlag.TRACKING_LOST.value)
+                    break
+
+                # Try to recover against the WHOLE map, not the local window:
+                # the local window is built from recent keyframes, which are
+                # exactly the ones the camera has just failed to match.
+                with timer.stage("relocalize"):
+                    all_descriptors, all_positions, all_ids = world_map.local_points(
+                        world_map.n_keyframes
+                    )
+                    recovered = relocalize(
+                        features, all_descriptors, all_positions, all_ids,
+                        matcher, camera,
+                    )
+
+                if not recovered.success:
+                    consecutive_lost += 1
+                    lost_frames += 1
+                    if lost_since is None:
+                        lost_since = frame.index
+                    if consecutive_lost >= max_consecutive_lost_frames:
+                        lost_at_frame = frame.index
+                        flags.append(ResultFlag.TRACKING_LOST.value)
+                        break
+                    # Skip this frame and try the next one. No pose is emitted,
+                    # so the trajectory has an honest hole rather than a guess.
+                    continue
+
+                relocalizations.append(
+                    {
+                        "frame_index": frame.index,
+                        "lost_since": lost_since,
+                        "gap_frames": consecutive_lost,
+                        "inliers": recovered.n_inliers,
+                    }
+                )
+                consecutive_lost = 0
+                lost_since = None
+                tracked = recovered
+                # The motion model is meaningless across a gap; start it again.
+                older_R = older_t = None
+                previous_R, previous_t = recovered.R, recovered.t
 
             poses.append(
                 TrackedPose(
                     frame.index, tracked.R, tracked.t, n_inliers=tracked.n_inliers
                 )
             )
+            older_R, older_t = previous_R, previous_t
             previous_R, previous_t = tracked.R, tracked.t
             frames_since_keyframe += 1
 
@@ -226,7 +381,35 @@ def run_pipeline(
                 translation,
                 median_depth,
                 tracked.inlier_ratio,
+                min_frames_between=min_frames_between_keyframes,
+                translation_fraction=keyframe_translation_fraction,
+                tracked_ratio_threshold=keyframe_tracked_ratio,
             )
+
+            record = None
+            if diagnostics is not None:
+                record = {
+                    "frame_index": frame.index,
+                    "n_features": len(features),
+                    "n_map_points": world_map.n_points,
+                    "n_local_points": len(point_ids),
+                    "n_visible": _count_visible(
+                        world_map, tracked.R, tracked.t, camera
+                    ),
+                    "n_matches": tracked.n_matches,
+                    "n_inliers": tracked.n_inliers,
+                    "inlier_ratio": round(tracked.inlier_ratio, 4),
+                    "is_keyframe": bool(insert),
+                    "n_culled": 0,
+                    "n_triangulated": 0,
+                    "median_depth": round(median_depth, 4),
+                    "translation_since_kf": round(translation, 4),
+                    "n_keyframes": world_map.n_keyframes,
+                    "tracking_failed": False,
+                    "failure_reason": tracked.reason,
+                }
+                diagnostics.append(record)
+
             if not insert:
                 continue
 
@@ -243,14 +426,23 @@ def run_pipeline(
                     world_map.observe(point_id, keyframe.id, feature_index)
 
             with timer.stage("triangulate"):
-                _triangulate_new_points(
+                n_triangulated = _triangulate_new_points(
                     world_map, last_keyframe, keyframe, matcher, camera
                 )
 
             with timer.stage("cull"):
-                world_map.cull(
-                    camera, MAX_MAP_POINT_ERROR_PX, MIN_OBSERVATIONS_TO_KEEP
+                n_culled = world_map.cull(
+                    camera,
+                    max_map_point_error_px,
+                    MIN_OBSERVATIONS_TO_KEEP,
+                    window=cull_window_keyframes,
                 )
+
+            if record is not None:
+                record["n_triangulated"] = n_triangulated
+                record["n_culled"] = n_culled
+                record["n_map_points"] = world_map.n_points
+                record["n_keyframes"] = world_map.n_keyframes
 
             last_keyframe_id = keyframe.id
             frames_since_keyframe = 0
@@ -263,6 +455,8 @@ def run_pipeline(
 
     if world_map.n_points < 50:
         flags.append(ResultFlag.FEW_MAP_POINTS.value)
+    if relocalizations:
+        flags.append(ResultFlag.RELOCALIZED.value)
 
     timing = timer.report(frames=len(poses))
     stats = {
@@ -276,6 +470,9 @@ def run_pipeline(
             world_map.mean_reprojection_error(camera), 3
         ),
         "tracking_lost_at_frame": lost_at_frame,
+        "n_relocalizations": len(relocalizations),
+        "relocalizations": relocalizations,
+        "frames_lost": lost_frames,
     }
 
     return PipelineResult(

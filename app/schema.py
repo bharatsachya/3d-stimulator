@@ -55,6 +55,7 @@ class ResultFlag(str, Enum):
     """
 
     TRACKING_LOST = "tracking_lost"
+    RELOCALIZED = "relocalized"
     FEW_MAP_POINTS = "few_map_points"
     BA_SKIPPED_FOR_TIME = "ba_skipped_for_time"
 
@@ -85,6 +86,10 @@ FAILURE_MESSAGES: dict[FailureReason, str] = {
 FLAG_MESSAGES: dict[ResultFlag, str] = {
     ResultFlag.TRACKING_LOST: (
         "Tracking was lost partway through; the trajectory shown stops at that point."
+    ),
+    ResultFlag.RELOCALIZED: (
+        "Tracking was lost and recovered at least once. The trajectory continues "
+        "across the gap, but the frames in between have no pose."
     ),
     ResultFlag.FEW_MAP_POINTS: (
         "The map is sparse, so the point cloud may look thin. More texture in the "
