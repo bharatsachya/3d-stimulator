@@ -552,11 +552,17 @@ def run_pipeline(
             last_keyframe_id = keyframe.id
             frames_since_keyframe = 0
 
-    if not initialized or world_map is None or camera is None:
+    # Fail only if NOTHING was reconstructed. With segment re-initialization the
+    # final segment can end mid-initialization -- the video simply ran out while
+    # a fresh map was being started -- and that must not discard the segments
+    # that already succeeded.
+    if not poses or camera is None:
         raise SlamFailure(
             FailureReason.INITIALIZATION_FAILED,
             "the video ended before a usable pair of frames was found",
         )
+    if world_map is None:
+        world_map = all_maps[-1] if all_maps else Map()
 
     # Loop closure runs once after tracking, over the finished map. See
     # vslam/loop.py for why this is offline rather than online.
