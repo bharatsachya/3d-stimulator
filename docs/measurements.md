@@ -523,3 +523,107 @@ For comparison with where Stage A began — 1.56 cm over 1.980 m at 23.4% covera
 | relocalize | 1.62 | 2.4 |
 | pnp | 1.42 | 2.1 |
 | triangulate | 1.28 | 1.9 |
+
+---
+
+# Stage G (first pass) — the benchmark that exposed the real limitation
+
+Running across five TUM sequences instead of one changed the picture completely.
+With skip-and-retry but no re-initialization:
+
+| sequence | frames | coverage | ATE cm | % of path |
+|---|---|---|---|---|
+| fr1_xyz | 798 | **99.7%** | 2.17 | 0.30 |
+| fr1_desk | 613 | **6.0%** | 3.26 | 7.99 |
+| fr1_desk2 | 640 | **5.8%** | 3.44 | 17.11 |
+| fr1_room | 1362 | **7.6%** | 3.31 | 5.66 |
+| fr2_desk | 2965 | **11.0%** | 8.68 | 3.51 |
+
+The 99.7% result was a property of **one sequence**, not of the system. Every
+other sequence terminated after hitting the same 60-frame lost cap.
+
+## Why, and why no parameter fixed it
+
+A death spiral: the map can only grow from tracked frames, so once tracking is
+lost the map freezes. A camera that explores *away* from its initial map can
+never re-acquire it, and waiting is futile. fr1_xyz survives only because its
+camera oscillates inside a volume roughly 0.94 m across and keeps returning.
+
+Confirmed by sweeping the obvious knobs across three sequences:
+
+| config | fr1_desk coverage | fr1_room coverage | fr1_xyz % of path |
+|---|---|---|---|
+| baseline (min 30 inliers) | 6.0% | 7.6% | 0.30 |
+| min 20 inliers | 6.5% | 7.6% | 0.27 |
+| min 15 inliers | 6.5% | 7.6% | 0.36 |
+| min 20 + keyframes at 5% depth | 6.5% | 7.6% | 0.37 |
+| min 15 + 5% + ratio 0.85 | 6.5% | 7.6% | 0.37 |
+
+Nothing moves. This is not a tuning problem.
+
+## The fix: re-initialize instead of waiting
+
+After a short wait, start a fresh map from the current frames and carry on.
+
+| sequence | before | after |
+|---|---|---|
+| fr1_desk coverage | 6.0% | **100.0%** |
+| fr1_desk poses | 13 | 85 |
+| fr1_desk error | 7.99% of path | **0.88%** |
+
+Each new segment carries its **own arbitrary scale and origin** — monocular
+scale is unobservable and nothing links a new segment's units to the old ones.
+Measured directly on fr1_xyz, the recovered scale factor per segment was 0.107,
+0.055, 0.026 and 0.067: four segments, four different units.
+
+Evaluation therefore aligns **each segment separately** and reports the
+pose-weighted RMS across them, with the segment count alongside. A trajectory in
+twenty pieces is a worse result than the same error in one piece, and the reader
+must be able to see that. Aligning the whole thing with one similarity transform
+would charge the system for a discontinuity it cannot observe.
+
+The trade is real: on fr1_xyz, where waiting *does* work, re-initialization
+costs accuracy (0.30% → 0.42%) by fragmenting a trajectory that would have
+recovered intact. It is on by default because the benchmark, not one sequence,
+decides.
+
+---
+
+# Stage E — loop closure
+
+## Detection works
+
+Bag-of-words over a 256-word vocabulary built from the sequence itself with
+`cv2.kmeans`, keyframes indexed by tf-idf-weighted histogram, queried by cosine
+similarity, every candidate geometrically verified by PnP before acceptance.
+
+On fr1_xyz: **102 candidates, 78 verified**, in 2.8 s. Rejected candidates
+failed on inlier count (24-30 against the required 40) and are logged rather
+than silently dropped.
+
+## The pose graph folded the trajectory, and why
+
+The first version asserted that the two ends of a closure occupy the **same
+position**. That is not what revisiting a place means — the camera returns
+*near* somewhere it has been, from a different spot and angle.
+
+The optimiser satisfied all 78 constraints exactly, drove the residual to
+**0.0000**, and collapsed the map: ATE went from 3.22 cm to 9.82 cm.
+
+*A residual of exactly zero against 78 over-determined constraints is evidence
+that the constraints are vacuous, not evidence of convergence.*
+
+The correct constraint was already being computed and thrown away. Geometric
+verification localises the query keyframe by PnP against the match keyframe's
+**old** map points, which predate the drift — so its recovered centre is a
+drift-corrected estimate of where that keyframe belongs. Each closure now
+contributes a unary pull toward that position. ATE 3.22 → 3.60 cm: no longer
+destructive, and no longer an improvement either.
+
+## Honest status
+
+Loop closure is implemented and **not yet demonstrated to help**. fr1_xyz is the
+wrong sequence to judge it on — it oscillates inside a 0.94 m box with error
+already at 0.45% of path, so there is no accumulated drift for a closure to
+correct. The claim in requirement 4 that loop closure corrects drift is
+well-founded in the literature and is *not* evidenced by any measurement here.
