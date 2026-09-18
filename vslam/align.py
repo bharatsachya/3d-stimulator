@@ -135,3 +135,80 @@ def centres_from_world_to_camera(poses: list) -> tuple[np.ndarray, list[int]]:
         centres.append(-matrix[:3, :3].T @ matrix[:3, 3])
         kept.append(index)
     return np.array(centres).T, kept
+
+
+def evaluate_segments(
+    exported: dict,
+    truth_centres: np.ndarray,
+    column_of_frame: dict,
+) -> dict:
+    """
+    ATE over a trajectory that may contain several map segments.
+
+    EACH SEGMENT IS ALIGNED SEPARATELY, and that is not a convenience.
+
+    When tracking cannot be recovered the pipeline starts a fresh map. A new map
+    has a new origin, a new orientation and -- because monocular scale is
+    unobservable -- a completely new arbitrary unit. Nothing measured by the
+    system relates the new segment's scale to the old one's. Aligning the whole
+    trajectory with a single similarity transform would therefore charge the
+    system for a discontinuity it cannot even observe, and would understate its
+    accuracy by an amount that depends only on how unlucky the scale jump was.
+
+    Aligning per segment reports what the system actually knows: the shape of
+    each reconstructed stretch. The number of segments is reported alongside,
+    because a trajectory in twenty pieces is a worse result than the same error
+    in one piece, and the reader must be able to see that.
+
+    The combined figure is the RMS across all poses -- pose-weighted, so a long
+    segment counts for more than a short one.
+    """
+    segments = exported.get("segments") or [0] * len(exported["poses"])
+    frame_indices = exported["frame_indices"]
+
+    squared_total = 0.0
+    pose_total = 0
+    path_total = 0.0
+    per_segment = []
+
+    for segment in sorted(set(segments)):
+        rows = [i for i, s in enumerate(segments) if s == segment]
+        pairs = [
+            (i, column_of_frame[frame_indices[i]])
+            for i in rows
+            if frame_indices[i] in column_of_frame
+        ]
+        if len(pairs) < 3:
+            continue
+
+        estimated = centres_from_camera_to_world(
+            [exported["poses"][i] for i, _ in pairs], undo_y_flip=True
+        )
+        metrics = absolute_trajectory_error(
+            estimated, truth_centres[:, [c for _, c in pairs]]
+        )
+        squared_total += (metrics["ate_rmse"] ** 2) * metrics["n_poses"]
+        pose_total += metrics["n_poses"]
+        path_total += metrics["truth_path_length"]
+        per_segment.append(
+            {
+                "segment": segment,
+                "poses": metrics["n_poses"],
+                "path_length": round(metrics["truth_path_length"], 3),
+                "ate_rmse": metrics["ate_rmse"],
+                "scale_factor": metrics["scale_factor"],
+            }
+        )
+
+    if pose_total == 0:
+        return {"n_poses": 0, "segments_evaluated": 0}
+
+    rmse = float(np.sqrt(squared_total / pose_total))
+    return {
+        "n_poses": pose_total,
+        "segments_evaluated": len(per_segment),
+        "ate_rmse": rmse,
+        "truth_path_length": path_total,
+        "rmse_over_path_pct": 100.0 * rmse / path_total if path_total > 1e-9 else None,
+        "per_segment": per_segment,
+    }

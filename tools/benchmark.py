@@ -45,9 +45,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vslam.align import (  # noqa: E402
-    absolute_trajectory_error,
-    centres_from_camera_to_world,
     centres_from_world_to_camera,
+    evaluate_segments,
 )
 from vslam.export import to_slam_result  # noqa: E402
 from vslam.pipeline import run_pipeline  # noqa: E402
@@ -77,20 +76,9 @@ def evaluate_one(video: Path, truth_path: Path, **kwargs) -> dict:
     elapsed = time.perf_counter() - started
 
     exported = to_slam_result(result).to_dict()
-    pairs = [
-        (position, column_of_frame[frame])
-        for position, frame in enumerate(exported["frame_indices"])
-        if frame in column_of_frame
-    ]
-    if len(pairs) < 3:
-        return {"error": f"only {len(pairs)} poses paired with ground truth"}
-
-    estimated = centres_from_camera_to_world(
-        [exported["poses"][p] for p, _ in pairs], undo_y_flip=True
-    )
-    metrics = absolute_trajectory_error(
-        estimated, truth_centres[:, [c for _, c in pairs]]
-    )
+    metrics = evaluate_segments(exported, truth_centres, column_of_frame)
+    if metrics.get("n_poses", 0) < 3:
+        return {"error": "too few poses could be paired with ground truth"}
 
     source_frames = result.stats["video"]["source_frames"]
     last_tracked = result.poses[-1].frame_index
@@ -105,12 +93,11 @@ def evaluate_one(video: Path, truth_path: Path, **kwargs) -> dict:
         "keyframes": result.stats["n_keyframes"],
         "map_points": result.stats["n_map_points"],
         "reprojection_px": result.stats["mean_reprojection_error_px"],
+        "segments": result.stats.get("n_segments", 1),
         "path_length_m": round(metrics["truth_path_length"], 3),
         "ate_rmse_cm": round(metrics["ate_rmse"] * 100, 2),
-        "ate_median_cm": round(metrics["ate_median"] * 100, 2),
-        "ate_max_cm": round(metrics["ate_max"] * 100, 2),
         "rmse_over_path_pct": round(metrics["rmse_over_path_pct"], 2),
-        "scale_factor": round(metrics["scale_factor"], 5),
+        "evaluated_poses": metrics["n_poses"],
         "ms_per_frame": round(result.timing["ms_per_frame"], 1),
         "wall_s": round(elapsed, 1),
         "stages": {
@@ -166,7 +153,7 @@ def main() -> None:
 
     print()
     header = (
-        f"{'sequence':<22}{'frames':>8}{'cover%':>8}{'path m':>8}"
+        f"{'sequence':<22}{'frames':>8}{'cover%':>8}{'seg':>5}{'path m':>8}"
         f"{'ATE cm':>8}{'%path':>7}{'kf':>5}{'points':>8}{'ms/fr':>8}"
     )
     print(header)
@@ -177,7 +164,7 @@ def main() -> None:
             continue
         print(
             f"{short:<22}{r['source_frames']:>8}{r['coverage_pct']:>8.1f}"
-            f"{r['path_length_m']:>8.2f}{r['ate_rmse_cm']:>8.2f}"
+            f"{r['segments']:>5}{r['path_length_m']:>8.2f}{r['ate_rmse_cm']:>8.2f}"
             f"{r['rmse_over_path_pct']:>7.2f}{r['keyframes']:>5}"
             f"{r['map_points']:>8}{r['ms_per_frame']:>8.1f}"
         )

@@ -65,6 +65,10 @@ class LoopCandidate:
     accepted: bool = False
     inliers: int = 0
     rejection: str = ""
+    # Where geometric verification says the query keyframe ACTUALLY is, solved
+    # against the match keyframe's older map points. This, not zero, is the
+    # loop constraint -- see the note in optimize_pose_graph.
+    recovered_centre: np.ndarray | None = None
 
 
 @dataclass
@@ -193,6 +197,12 @@ def _verify(
         )
         return
 
+    R, _ = cv2.Rodrigues(rvec)
+    # PnP solved the query frame's pose against map points expressed in world
+    # coordinates, so this is a world->camera pose. Its centre is a drift-
+    # corrected estimate of where that keyframe really is, because the points
+    # constraining it were triangulated long before the drift accumulated.
+    candidate.recovered_centre = (-R.T @ tvec.ravel()).copy()
     candidate.accepted = True
 
 
@@ -250,23 +260,43 @@ def optimize_pose_graph(
          centres[i + 1] - centres[i])
         for i in range(n - 1)
     ]
-    # A loop edge asserts the two keyframes are at the SAME place, so the
-    # relative translation it demands is zero.
-    loop_edges = [
-        (index_of[c.match_keyframe], index_of[c.query_keyframe], np.zeros(3))
+    # ------------------------------------------------------------------
+    # A LOOP EDGE IS NOT "THESE TWO KEYFRAMES ARE THE SAME POINT".
+    #
+    # The first version asserted exactly that -- a zero relative translation
+    # between the two ends of every closure -- and it was badly wrong. Revisiting
+    # a place does not mean occupying the same position: the camera comes back
+    # NEAR somewhere it has been, from a different spot, at a different angle.
+    #
+    # Measured on fr1_xyz, which revisits its small volume constantly: 78
+    # verified closures, the optimiser drove the residual to exactly 0.0000 by
+    # satisfying every one of them, and ATE went from 3.22 cm to 9.82 cm. It
+    # folded the trajectory in on itself precisely as instructed. A residual of
+    # zero against 78 over-determined constraints should itself have been read
+    # as a sign the constraints were vacuous.
+    #
+    # The correct constraint is the one geometric verification already computed
+    # and this code was discarding: PnP localised the query keyframe against the
+    # match keyframe's OLD map points, which predate the drift, so its recovered
+    # centre is a drift-corrected estimate of where that keyframe belongs. Each
+    # closure therefore contributes a unary pull towards that position.
+    # ------------------------------------------------------------------
+    loop_anchors = [
+        (index_of[c.query_keyframe], c.recovered_centre)
         for c in accepted
-        if c.match_keyframe in index_of and c.query_keyframe in index_of
+        if c.query_keyframe in index_of and c.recovered_centre is not None
     ]
-    if not loop_edges:
+    if not loop_anchors:
         return LoopClosureResult(
-            candidates=loops, accepted=accepted, reason="loop keyframes not in map"
+            candidates=loops, accepted=accepted, reason="no verified loop poses"
         )
 
     x0 = np.hstack([centres.ravel(), np.zeros(n)])  # positions + log-scales
 
-    # Loop edges must outweigh a single sequential edge or the optimiser simply
-    # ignores them; sequential edges outnumber them by orders of magnitude.
-    loop_weight = float(np.sqrt(len(sequential)))
+    # Loop constraints must carry enough weight to be heard against the
+    # sequential chain, but not so much that they override it: the sequential
+    # edges are what hold the shape of the trajectory together.
+    loop_weight = 1.0
 
     def residuals(x: np.ndarray) -> np.ndarray:
         positions = x[: n * 3].reshape(-1, 3)
@@ -277,8 +307,8 @@ def optimize_pose_graph(
             # is how accumulated scale drift is allowed to be absorbed.
             scale = np.exp(0.5 * (log_scale[a] + log_scale[b]))
             out.append((positions[b] - positions[a]) - scale * measured)
-        for a, b, measured in loop_edges:
-            out.append(loop_weight * ((positions[b] - positions[a]) - measured))
+        for node, anchor in loop_anchors:
+            out.append(loop_weight * (positions[node] - anchor))
         # Anchor the gauge: the first keyframe stays put at unit scale.
         out.append(10.0 * (positions[0] - centres[0]))
         out.append(np.array([10.0 * log_scale[0]]))
