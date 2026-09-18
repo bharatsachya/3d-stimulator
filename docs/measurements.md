@@ -421,3 +421,105 @@ The entire gain comes from the far simpler change of not giving up after a
 single failed frame. Relocalization is retained because it should matter on
 sequences where the camera is lost for longer, but **it is unvalidated and is
 not what produced this result.**
+
+---
+
+# Stage C — bundle adjustment
+
+Sliding window over the last 5 keyframes, optimising poses **and** points
+jointly, `scipy.optimize.least_squares` with `method="trf"`, a sparse Jacobian
+supplied via `jac_sparsity`, Huber loss at 2 px, and the first keyframe in the
+window held fixed to remove gauge freedom.
+
+## The first version was a no-op, and nearly shipped as one
+
+It reduced reprojection error by 0.2% and recovered 0.1% of a deliberately
+injected perturbation. It terminated after **two function evaluations** with
+status 3 (`xtol` satisfied) while the gradient norm was still **3143** — nowhere
+near a minimum.
+
+The cause was variable scaling. The parameter vector mixes rotation vectors in
+radians, translations, and 3D point coordinates, which respond at completely
+different magnitudes. Across 3549 parameters the *relative* step looked
+negligible even when the absolute step was not, so `trf` concluded it had
+converged before it had started. Recovering a known 0.05-unit perturbation of
+the map points:
+
+| tolerances | x_scale | recovered |
+|---|---|---|
+| xtol 1e-4 | 1.0 | **0.1%** (the shipped configuration) |
+| xtol 1e-10 | 1.0 | 1.7% |
+| xtol 1e-10 | **"jac"** | **86.6%** |
+
+`x_scale="jac"` rescales each variable by its Jacobian column, and is the
+standard remedy for a badly-scaled bundle adjustment.
+
+### How nearly this was missed
+
+Three earlier experiments varying `diff_step`, tolerances and `x_scale` all
+returned **byte-identical** results, which read as strong evidence that none of
+them mattered. They were no-ops: `ba.py` does
+`from scipy.optimize import least_squares`, so patching
+`scipy.optimize.least_squares` never touched the imported name.
+
+The lesson is worth more than the bug. *Identical numbers across varied inputs
+are evidence of a broken experiment, not of an insensitive system.* A parameter
+sweep that returns the same answer for every setting should be disbelieved
+before it is reported.
+
+## What BA is worth, measured end to end
+
+| config | poses | path m | ATE cm | % of path | ms/frame | BA ms/frame |
+|---|---|---|---|---|---|---|
+| no BA | 234 | 7.069 | 3.59 | 0.51 | 24.8 | 0 |
+| nfev 20, every keyframe | 238 | 7.161 | 3.43 | 0.48 | 43.6 | 20.1 |
+| **nfev 50, every 2nd keyframe** | 235 | 7.142 | **3.22** | **0.45** | 70.8 | 46.0 |
+| nfev 50, every keyframe | 243 | 7.415 | 4.19 | 0.57 | **106.0** | 83.9 |
+
+Every second keyframe is the shipped default. Running BA on *every* keyframe
+costs 106 ms/frame — over the 100 ms budget — and scores **worse**. More
+optimisation is not monotonically better when it competes for time with the
+frames that feed it.
+
+## An honest limit: BA does not fix drift
+
+Applied as a single global pass over all 52 keyframes on a fixed trajectory,
+before the scaling bug was found, BA moved ATE by **nothing** (3.77 cm before and
+after) while reprojection error fell 0.14%. Even working correctly the effect is
+modest, and the reason is structural rather than a tuning failure:
+
+**BA minimises reprojection error, and drift is nearly invisible to reprojection
+error.** A slowly accumulating scale or pose error remains perfectly consistent
+with every observation that produced it — the reconstruction can bend or shrink
+and the images still explain it. Only an observation linking distant parts of the
+trajectory introduces a constraint that drift violates, which is loop closure.
+
+## Result on the target instance
+
+EC2 `m7i-flex.large`, TUM fr1_xyz, with relocalization and BA:
+
+| metric | value |
+|---|---|
+| coverage | **99.7%** of the sequence, tracking never lost |
+| poses | 241 evaluated |
+| keyframes / map points | 54 / 5366 |
+| mean reprojection | 0.897 px |
+| ground-truth path | 7.239 m |
+| **ATE RMSE** | **2.17 cm** |
+| ATE median / max | 1.63 / 7.55 cm |
+| **RMSE / path length** | **0.30%** |
+| wall | 66.5 ms/frame against a 100 ms budget |
+
+For comparison with where Stage A began — 1.56 cm over 1.980 m at 23.4% coverage,
+0.79% of path — this is **4.3x the coverage at 2.6x better relative accuracy**.
+
+| stage | ms/frame | % of wall |
+|---|---|---|
+| bundle_adjustment | 39.47 | 59.4 |
+| match_map | 8.50 | 12.8 |
+| orb | 6.48 | 9.7 |
+| cull | 3.86 | 5.8 |
+| decode | 1.98 | 3.0 |
+| relocalize | 1.62 | 2.4 |
+| pnp | 1.42 | 2.1 |
+| triangulate | 1.28 | 1.9 |
