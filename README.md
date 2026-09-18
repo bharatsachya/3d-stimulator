@@ -10,130 +10,95 @@ measured per-stage timing breakdown. It runs on two free-tier vCPUs with no GPU.
 
 ## Results
 
-Accuracy is measured against the [TUM RGB-D benchmark](https://cvg.cit.tum.de/data/datasets/rgbd-dataset)
-sequence `freiburg1_xyz`, whose ground-truth trajectory comes from a 100 Hz
-motion-capture system. Every figure below was produced on the deployment
-instance by:
+Measured on the deployment instance across five sequences of the
+[TUM RGB-D benchmark](https://cvg.cit.tum.de/data/datasets/rgbd-dataset), whose
+ground-truth trajectories come from a 100 Hz motion-capture system.
 
 ```bash
-python tools/evaluate.py samples/tum_fr1_xyz.mp4 samples/tum_fr1_xyz.truth.json --runs 3
+python tools/benchmark.py --dataset-root ~/tum --out out/benchmark.json
 ```
 
-| metric | value |
-|---|---|
-| ATE RMSE | **1.56 cm** |
-| ATE median | 1.28 cm |
-| ATE max | 4.24 cm |
-| ground-truth path over the evaluated segment | 1.980 m |
-| **RMSE as a fraction of path length** | **0.79%** |
-| poses evaluated | 62 |
-| keyframes | 17 |
-| map points | 2121 |
-| mean reprojection error | 0.813 px |
-| run-to-run standard deviation over 3 runs | 0.000 cm |
+| sequence | frames | coverage | segments | path | ATE RMSE | **% of path** | ms/frame |
+|---|---|---|---|---|---|---|---|
+| fr1_xyz | 798 | 99.7% | 5 | 4.93 m | 1.57 cm | **0.32%** | 61.4 |
+| fr1_desk | 613 | 100.0% | 14 | 3.67 m | 2.82 cm | **0.77%** | 44.1 |
+| fr1_desk2 | 640 | 92.0% | 13 | 1.98 m | 3.10 cm | **1.57%** | 60.3 |
+| fr1_room | 1362 | 99.9% | 27 | 5.92 m | 3.26 cm | **0.55%** | 55.0 |
+| fr2_desk | 2965 | 100.0% | 13 | 14.71 m | 11.75 cm | **0.80%** | 59.3 |
 
-### Read the coverage before the accuracy
+Every sequence completes inside the 100 ms/frame budget on two vCPUs with no GPU.
+A fresh run of fr1_desk afterwards returned 100.0% coverage, 14 segments,
+2.82 cm and 0.77% against the benchmark's identical figures — accuracy is
+deterministic on a given machine.
 
-**That 1.56 cm covers 62 poses spanning source frames 0–183 of 798 — 23.4% of
-the sequence. Tracking is lost at frame 186 and there is no relocalization, so
-the run ends there.** (62 poses is the expected count for that span, since the
-pipeline processes every third frame; 62/798 is not the coverage figure and
-quoting it that way would understate coverage as 7.8%.) An ATE quoted without its coverage is close to meaningless, because a
-system that gives up early reports a better number than one that keeps going,
-for the worst possible reason. The honest one-line statement is:
+### Read the coverage and the segment count, not just the error
 
-> ATE RMSE 1.56 cm over the tracked segment — 62 poses covering frames 0–183 of
-> 798, 23.4% of the sequence, 1.980 m of ground-truth path — with tracking lost
-> at frame 186 and no relocalization implemented.
+Three numbers are needed to judge any row, and quoting the error alone would be
+misleading in two separate directions.
 
-**Bundle adjustment is not implemented yet.** This figure is what map-based
-tracking, the parallax gate and reprojection culling achieve on their own.
+**Coverage** is the fraction of the sequence that produced poses at all. A system
+that gives up early reports a *better* ATE than one that keeps going, for the
+worst possible reason. An earlier version of this system reported 1.56 cm on
+fr1_xyz over 23.4% of the sequence; the honest comparison is against the 0.32%
+of path it now achieves over 99.7%.
 
-### What happens to error as the path grows
+**Segments** is how many times the map had to be restarted. When tracking cannot
+be recovered the pipeline begins a fresh map rather than stopping — and a new map
+has a new origin, a new orientation and, because monocular scale is unobservable,
+a **new arbitrary unit**. Measured directly on fr1_xyz, the recovered scale factor
+for its four segments was 0.107, 0.055, 0.026 and 0.067: four segments, four
+different units, nothing in the images relating them.
 
-Rather than assert how drift would extrapolate to the full sequence, it was
-measured over growing prefixes of the tracked segment:
+So each segment is Sim(3)-aligned **separately** and the reported ATE is the
+pose-weighted RMS across them. Aligning the whole trajectory with a single
+transform would charge the system for a discontinuity it cannot observe. But a
+trajectory in 27 pieces is plainly a worse result than the same error in one
+piece, and the count is printed so the reader can see it. fr1_room's 0.55% is
+across 27 restarts; fr1_xyz's 0.32% is across 5.
 
-| poses | ground-truth path | ATE RMSE | % of path |
-|---|---|---|---|
-| 10 | 0.379 m | 0.84 cm | 2.23% |
-| 24 | 0.840 m | 1.14 cm | 1.36% |
-| 38 | 1.335 m | 1.61 cm | 1.20% |
-| 52 | 1.820 m | 1.49 cm | 0.82% |
-| 59 | 1.941 m | 1.67 cm | 0.86% |
+### Excluded sequences, and why
 
-A power-law fit gives `ATE ~ path^0.46` — sublinear, with the error *fraction*
-falling as the path lengthens. That is not a general claim about the system and
-should not be read as one. `fr1_xyz` confines the camera to a box roughly 0.94 m
-across and repeatedly revisits it, so the camera keeps re-observing map points it
-has already triangulated instead of extending into new territory. That is
-map-based tracking working as intended, and it is also exactly the condition
-under which drift is least visible. **A sequence that explores new space would
-behave differently, and that has not been measured here.** No extrapolation to
-the full 798 frames is offered in either direction.
+`fr1_360` and `fr1_floor` are excluded. The ORB-SLAM authors note that sequences
+dominated by rotation without translation, or with no texture, are unsuitable for
+monocular systems, because a monocular system cannot initialise without parallax
+— a property of the sensor rather than of the implementation (Mur-Artal, Montiel
+and Tardós, *ORB-SLAM: A Versatile and Accurate Monocular SLAM System*, IEEE
+T-RO 2015). They are named here rather than quietly omitted.
+
+The low-texture case is demonstrated separately on fr3
+`nostructure_notexture_far`, where the required behaviour is a clear diagnosis
+rather than a reconstruction — see *Failure modes* below.
 
 ### On the alignment, and why scale is solved for
 
-ATE is computed after aligning the estimated and true trajectories with a
+ATE is computed after aligning estimated and true trajectories with a
 **similarity transform — rotation, translation and one scale factor, seven
 degrees of freedom**, using Umeyama's closed-form solution.
 
 The scale term is not a convenience. A monocular reconstruction is defined only
-up to scale, because a small scene viewed closely and a large one viewed from
-far away produce identical images. Comparing against metric ground truth without
-solving for scale would measure that arbitrary choice rather than any error the
-system made. Seven-DOF alignment is the standard procedure for monocular
-evaluation and is what the ORB-SLAM papers report for their monocular results.
-The recovered factor on this run is 0.0388, which is meaningful only as "the
-arbitrary units are about 1/26 of a metre each".
+up to scale: a small scene viewed closely and a large one viewed from far away
+produce identical images. Comparing against metric ground truth without solving
+for scale would measure that arbitrary choice rather than any error the system
+made. Seven-DOF alignment is the standard procedure for monocular evaluation and
+is what the ORB-SLAM papers report.
 
-The alignment deliberately **refuses to absorb reflections**: its rotation is
-constrained to determinant +1. That constraint caught a real class of bug, as
-described under *Measurement discipline* below.
-
-### Path length, and why it is stated with its interval
-
-Path length depends on which interval and which sampling rate you measure, so
-quoting a percentage without them is not reproducible. Measured from
-`groundtruth.txt` directly:
-
-| interval | samples | path |
-|---|---|---|
-| full motion-capture span, 100 Hz | 3000 | 9.159 m |
-| RGB frame span, every frame | 796 | 8.011 m |
-| RGB frame span, at the 10 Hz processing rate | 266 | 7.985 m |
-| **evaluated (tracked) segment** | **62** | **1.980 m** |
-
-The 8.011 m against 7.985 m difference shows the figure is not inflated by
-motion-capture jitter — changing the sampling rate moves it by 0.3%, so the path
-is genuine motion rather than accumulated noise.
-
-Published summaries of this sequence quote a trajectory length that differs from
-the 9.159 m measured here from the distributed `groundtruth.txt`. That
-discrepancy was noticed and deliberately not resolved by guessing: the convention
-behind the published figure has not been established, so no claim is made about
-it. Every path length in this document is computed from the distributed file by
-the command shown above, with its interval and sampling rate stated, so a reader
-can reproduce each one exactly.
+The alignment deliberately **refuses to absorb reflections** — its rotation is
+constrained to determinant +1 — which caught a real class of bug, described under
+*Measurement discipline*.
 
 ### Failure modes produce different advice
 
-Two clips that must fail, and do:
-
 | clip | diagnosis | what the user is told |
 |---|---|---|
-| synthetic pure rotation | median **484** matches, **0.00°** parallax | move sideways through the scene |
+| pure rotation | median **484** matches, **0.00°** parallax | move sideways through the scene |
 | TUM `nostructure_notexture_far` | median **3** matches | the scene needs texture |
 
-Making these differ was deliberate work, not a formatting exercise. Both look
-identical from the outside — initialization fails — but *"try walking sideways
-past the subject"* is actively wrong advice for someone filming a blank wall, and
-*"find more texture"* is useless to someone who is standing still and turning.
-The pipeline distinguishes them by how far the failure got: plenty of matches
-with no parallax means the camera did not translate; almost no matches means
-there was nothing to match.
-
----
+Making these differ was deliberate work. Both look identical from outside —
+initialization fails — but *"try walking sideways"* is actively wrong advice for
+someone filming a blank wall, and *"find more texture"* is useless to someone
+standing still and turning. The pipeline separates them by how far the failure
+got: plenty of matches with no parallax means the camera did not translate;
+almost no matches means there was nothing to match.
 
 ## Timing
 
@@ -148,55 +113,55 @@ The measurement environment is the deliverable as much as the number is.
 | OS | Ubuntu 24.04.4 LTS, Linux 6.17.0-1017-aws |
 
 At 10 fps processing the budget is **100 ms per frame**. Measured on the
-instance, `tum_fr1_xyz.mp4`, 640 px working width, 1000 features:
+instance, fr1_xyz, 640 px working width, 1000 features, with bundle adjustment
+and re-initialization enabled:
 
 | stage | ms/frame | % of wall |
 |---|---|---|
-| match_map | 6.62 | 27.4 |
-| orb | 6.55 | 27.1 |
-| cull | 4.14 | 17.2 |
-| decode | 1.96 | 8.1 |
-| triangulate | 1.49 | 6.2 |
-| pnp | 1.45 | 6.0 |
-| local_map | 0.70 | 2.9 |
-| initialize | 0.36 | 1.5 |
-| unaccounted | — | 3.5 |
-| **total** | **24.14** | 100 |
+| bundle_adjustment | 39.47 | 59.4 |
+| match_map | 8.50 | 12.8 |
+| orb | 6.48 | 9.7 |
+| cull | 3.86 | 5.8 |
+| decode | 1.98 | 3.0 |
+| relocalize | 1.62 | 2.4 |
+| pnp | 1.42 | 2.1 |
+| triangulate | 1.28 | 1.9 |
+| local_map | 0.97 | 1.5 |
+| unaccounted | — | 1.3 |
+| **total** | **66.50** | 100 |
 
-**24 ms per frame against a 100 ms budget, on two free-tier vCPUs with no GPU.**
-The modest hardware is the point of the result, not an apology for it: the brief
-asks for an algorithm that performs under constrained resources, and meeting the
-budget four times over on the smallest sensible instance is the claim.
+Across the five benchmark sequences the range is **44–61 ms/frame**, all inside
+the budget, on two free-tier-eligible vCPUs with no GPU. The modest hardware is
+the point of the result, not an apology for it: the brief asks for an algorithm
+that performs under constrained resources, and the constraint is met with room
+to spare on the smallest sensible instance.
 
-`unaccounted` is wall clock minus the sum of the measured stages. It is reported
-so that the breakdown cannot silently omit time; if it ever grows, something real
-is happening outside the instrumented stages.
+`unaccounted` is wall clock minus the sum of measured stages. It is reported so
+the breakdown cannot silently omit time.
 
 ### The workload does not want more cores
 
-Measured with `tools/probe.py`, varying OpenCV's thread count. **On the target
+Measured with `tools/probe.py`, varying OpenCV's thread count **on the target
 instance**, which has 2 vCPUs:
 
-| threads | ms/frame (floor) |
+| threads | ms/frame (per-frame floor) |
 |---|---|
 | 1 | 13.3 |
 | 2 | 13.1 |
 
-Essentially flat — the second thread buys about 2%. That is consistent with what
-`lscpu` reports: the instance's two vCPUs are two hardware threads on a *single
-physical core*, so there is no second execution unit for the work to spread
-across. This pipeline is effectively single-core-bound on this machine.
+Essentially flat — the second thread buys about 2%. `lscpu` explains it: the two
+vCPUs are two hardware threads on a **single physical core**, so there is no
+second execution unit to spread across. This pipeline is effectively
+single-core-bound here.
 
-The development laptop, which has eight real cores, behaves completely
-differently on the same clip and settings — 29.85 ms/frame at one thread, 17.67
-at two, 18.26 at four, 19.16 at eight. There the second thread is worth 40% and
-scaling stops after that.
+The development laptop, with eight real cores, behaves completely differently on
+the same clip and settings: 29.85 ms/frame at one thread, 17.67 at two, 18.26 at
+four, 19.16 at eight — the second thread is worth 40% and scaling stops after it.
 
-The two tables together are the argument for the small instance. A larger one
-would add cores this workload demonstrably cannot use, and the target already
-meets the budget four times over on a single physical core. That is a measured
-conclusion rather than a rationalisation — and note that the laptop table alone
-would have supported a *wrong* one, namely that two threads matter a great deal.
+Together the two tables are the argument for the small instance: a larger one
+would add cores this workload demonstrably cannot use. Note also that the laptop
+table *alone* would have supported a wrong conclusion, namely that thread count
+matters a great deal here.
 
 Six consecutive runs on the instance held between 13.2 and 13.0 ms/frame for the
 per-frame floor with 0% CPU steal, so `m7i-flex` burst behaviour is not
@@ -239,6 +204,51 @@ is constrained to proper rotations precisely so it cannot quietly absorb one.
 Running the evaluator both ways: undoing the flip reproduces the pre-export ATE
 exactly, leaving it in place produces a worse one. A silently mirrored
 trajectory is a bug that looks like drift, and this is how it reveals itself.
+
+**Bundle adjustment shipped as a no-op, and a parameter sweep hid it.** The
+first working BA reduced reprojection error by 0.2% and recovered 0.1% of a
+deliberately injected perturbation. It terminated after *two* function
+evaluations reporting `xtol` convergence, while the gradient norm was 3143. The
+cause was variable scaling: the parameter vector mixes rotation vectors in
+radians, translations and 3D coordinates, and across 3549 parameters the
+relative step looked negligible even when the absolute step was not. With
+`x_scale="jac"`, recovery of the same perturbation went from 0.1% to **86.6%**.
+
+Worse — and more instructive — three earlier experiments varying `diff_step`,
+tolerances and `x_scale` all returned **byte-identical** results, which read as
+strong evidence that none of them mattered. They were no-ops: `ba.py` does
+`from scipy.optimize import least_squares`, so patching
+`scipy.optimize.least_squares` never touched the imported name. *Identical
+numbers across varied inputs are evidence of a broken experiment, not of an
+insensitive system.* There is now a regression test that demands BA recover a
+known perturbation, because every structural check — it runs, it returns, its
+Jacobian sparsity is provably correct — passed against the broken version.
+
+**A loop-closure constraint folded the trajectory, and a residual of zero gave
+it away.** The first pose graph asserted that the two ends of a closure occupy
+the same position. Revisiting a place does not mean that — the camera returns
+*near* somewhere it has been. The optimiser satisfied all 78 constraints exactly,
+drove the residual to **0.0000**, and collapsed the map: ATE 3.22 cm → 9.82 cm.
+A residual of exactly zero against 78 over-determined constraints is evidence
+the constraints are vacuous, not evidence of convergence. The correct constraint
+was already being computed and discarded — PnP localises the query keyframe
+against *old* map points that predate the drift, so its recovered centre is a
+drift-corrected estimate of where that keyframe belongs.
+
+**One good sequence is not a result.** Before the benchmark existed, this system
+reported 99.7% coverage on fr1_xyz and that looked like a general claim. Run
+across five sequences, coverage on the other four was **6–11%**. The 99.7% was a
+property of one clip whose camera oscillates inside a 0.94 m box and keeps
+returning to mapped territory. Everything downstream of that discovery — the
+re-initialization design, the segment-aware evaluation, the threshold chosen by
+cross-sequence sweep — exists because a second sequence was tried.
+
+**The map cull ran for 17% of frame time and removed nothing.** Sweeping its
+threshold showed zero points culled across an entire sequence at the shipped
+5 px, making it byte-identical to disabling it. The cause is structural:
+triangulation already admits only points below 4 px reprojection error, so a
+5 px cull cannot fire on anything triangulation let through. Nothing in the
+source suggests this; only the profile and the sweep do.
 
 **A threshold was measured and deliberately not shipped.** During initialization
 the ratio of homography inliers to homography-plus-fundamental inliers is a
@@ -434,54 +444,151 @@ way to run out of map: turning a corner leaves the existing points behind with
 very little translation, and waiting for the translation trigger would lose
 tracking first.
 
-### Bundle adjustment — designed, not yet implemented
+### Bundle adjustment
 
-**Status: not implemented.** The accuracy figures above are pre-BA. The design
-is settled and the pipeline has a place for it at the keyframe step:
+A **sliding window over the last 5 keyframes**, optimising poses *and* points
+jointly — not pose-only, which would take the points as truth and force all the
+error into the cameras, exactly the wrong place when the points are themselves
+noisy triangulations. `scipy.optimize.least_squares`, `method="trf"`, Huber loss
+at 2 px so a surviving mismatch cannot dominate the sum, the first keyframe held
+fixed to remove gauge freedom, and a hard `max_nfev` ceiling so the optimiser
+cannot eat the time budget.
 
-A **sliding window over the last 5 keyframes**, not full history. Full-history
-cost grows with video length, so a longer clip would blow the time budget for
-reasons unrelated to how hard the reconstruction is. `scipy.optimize.least_squares`
-with method `trf` and a sparse `jac_sparsity` mask, Huber loss at δ = 2 px, a
-hard `max_nfev = 50` ceiling so the optimizer cannot eat the budget, and the
-first keyframe's pose held fixed to fix the gauge.
+The sparse Jacobian matters more than anything else here. With 5 keyframes and
+~2000 points the parameter vector has ~6000 entries; a dense Jacobian would be
+~10^8 entries estimated by finite differences, one column per parameter. Almost
+every entry is structurally zero — a residual for point P in keyframe K depends
+only on P's three coordinates and K's six pose parameters — and passing that
+structure as `jac_sparsity` is the difference between feasible and impossible.
 
-SciPy rather than g2o or Ceres is deliberate and is a real tradeoff, not a
-free choice: SciPy installs from a wheel with no build step and every line of the
-residual function is readable, which matters for a system whose author must be
-able to explain it. It is meaningfully slower than Ceres. That is the cost, and
-it is accepted knowingly.
+Sliding window, not full history: full-history cost grows with video length, so a
+longer clip would blow the budget for reasons unrelated to how hard the
+reconstruction is. The trade is real — a window cannot correct drift that
+accumulated before it.
+
+SciPy rather than g2o or Ceres is deliberate and genuinely costly: SciPy installs
+from a wheel with no build step and every line of the residual function is
+readable, which matters for a system whose author must be able to explain it. It
+is meaningfully slower than Ceres. BA is 59% of frame time here, and a Ceres
+implementation would reclaim most of that.
+
+**What BA is worth, measured.** Running it every *second* keyframe at
+`max_nfev=50` improves ATE from 0.51% to 0.45% of path on fr1_xyz. Running it on
+*every* keyframe costs 106 ms/frame — over budget — and scores **worse** (0.57%).
+More optimisation is not monotonically better when it competes for time with the
+frames that feed it.
+
+**And an honest limit: BA does not fix drift.** Applied as a single global pass
+over all 52 keyframes of a fixed trajectory, it moved ATE by *nothing*. The
+reason is structural: BA minimises reprojection error, and drift is nearly
+invisible to reprojection error — a slowly accumulating scale or pose error stays
+perfectly consistent with every image that produced it. Only an observation
+linking distant parts of the trajectory violates it, which is loop closure.
+
+### Surviving tracking loss, and re-initializing when that fails
+
+Tracking loss is not a defect to be prevented; it is what happens when a camera
+explores. Two mechanisms, both chosen on measurement:
+
+**Skip and retry.** A failed frame no longer ends the run — it is skipped, no
+pose emitted, and the next frame tried. On fr1_xyz this alone took coverage from
+22.7% to **99.7%**, and error as a fraction of path from 0.86% to 0.51%.
+Relocalization against the whole map was also implemented as a second line of
+defence; ablating it changed the result by **nothing**, because it never once
+succeeded. It is retained for harder cases and reported as unvalidated.
+
+**Re-initialization.** Skip-and-retry generalised poorly: 6–11% coverage on the
+other four benchmark sequences. The map can only grow from tracked frames, so
+once tracking is lost the map freezes, and a camera exploring *away* from its
+initial map can never re-acquire it. After 8 lost frames the pipeline therefore
+starts a fresh map and carries on. The wait was swept across three sequences:
+
+| wait | fr1_xyz % of path | fr1_desk coverage / error | fr1_room coverage / error |
+|---|---|---|---|
+| off | 0.30 | 6.0% / 7.99% | 7.6% / 5.66% |
+| **8** | **0.32** | **100.0% / 0.77%** | **99.9% / 0.55%** |
+| 20 | 0.31 | 100.0% / 1.21% | 99.9% / 0.84% |
+| 35 | 0.30 | 83.8% / 2.06% | 95.7% / 1.18% |
+
+Waiting longer preserves a single coordinate frame where tracking *will* recover,
+which is why the easiest sequence mildly prefers it. Eight costs fr1_xyz 0.02
+percentage points and takes the others from single-digit coverage to complete.
+
+### Loop closure
+
+Bag-of-words place recognition over a 256-word vocabulary built from the sequence
+itself, keyframes indexed by tf-idf histogram and queried by cosine similarity,
+with every candidate geometrically verified by PnP before acceptance. Detection
+works: 102 candidates and **78 verified closures** on fr1_xyz in 2.8 s. A Sim(3)
+pose graph — 7 DOF per node, because monocular scale *drifts* and a rigid SE(3)
+graph has no parameter able to absorb that — distributes the error backwards.
+
+`cv2.kmeans` rather than scikit-learn's `MiniBatchKMeans`: OpenCV is already a
+dependency, and adding a large one for a single function call sits badly with a
+project whose argument is about constrained compute. No accuracy claim is made
+either way. A caveat is documented in the source: ORB descriptors are binary, and
+k-means on binary data treated as floats approximates DBoW2's k-majority rather
+than matching it.
+
+**Status: implemented, not demonstrated to help.** On fr1_xyz it moves ATE from
+3.22 cm to 3.60 cm — no longer destructive after the constraint fix, and no
+improvement. That sequence oscillates inside a 0.94 m box with error already at
+0.45% of path, so there is no accumulated drift for a closure to correct. The
+literature's claim that loop closure corrects drift is well-founded; **it is not
+evidenced by any measurement in this repository**, and is not claimed to be.
 
 ### Rejections, on measurement
 
-**Lucas–Kanade inter-frame tracking was rejected on profiling data.** Replacing
-descriptor matching with optical-flow tracking between frames is a well-known way
-to cut per-frame cost, and it is what several reference implementations do. On
-the target instance `match_map` costs 6.62 ms of a 24.14 ms frame, so the
-absolute ceiling on the saving is about 6.6 ms — against 76 ms of unused budget.
-Removing it would not change whether the system meets its target.
+Four things were built or specified, measured, and not shipped. They are listed
+because a decision rejected on evidence says more than one adopted on taste.
 
-It is worth being precise about how this number was arrived at, because the
-laptop profile would have supported a much stronger version of the same
-conclusion: there, matching is 1.61 ms and the ceiling looks like 1.5 ms. The
-target says 6.62 ms — four times larger. The conclusion survives the correction,
-but only because the headroom is large; a tighter budget would have made this
-worth doing. LK's remaining genuine case is robustness through gradual appearance
+**Projection-guided matching — implemented and rejected.** Predicting the pose,
+projecting each map point, and searching only nearby keypoints is what ORB-SLAM
+does, and in isolation the evidence was strong: at the exact frame where tracking
+died, 203 matches against brute force's 90. End to end it was consistently worse
+— **23 poses against 59**, at every radius and ratio tested.
+
+The investigation was worth more than the feature. The isolated test used the
+*true* pose; the pipeline only has a *predicted* one, and constant-velocity
+prediction error measured a median of 8–23 px with a maximum of 165 px, so
+correct matches routinely fell outside the search disc. Two further errors
+surfaced: the radius was never the live variable (a `k=8` neighbour cap binds
+first, which is why r=30, 60 and 100 gave *identical* results), and the raw
+counts were never comparable (brute force assigns several keypoints to one map
+point; the projection matcher enforces one-to-one). Kept behind a flag, off by
+default, because the mechanism is sound and would likely win with a better
+motion model.
+
+**Lucas–Kanade inter-frame tracking — rejected on profiling.** Replacing
+descriptor matching with optical flow is a known way to cut per-frame cost. On
+the target instance `match_map` costs 8.50 ms of a 66.5 ms frame, so the ceiling
+on the saving is about 8.5 ms against 33 ms of unused budget.
+
+The number matters and it is worth being precise about which machine produced it.
+The laptop profile would have supported a much stronger version of this
+conclusion — there matching is 1.61 ms and the ceiling looks like 1.5 ms. The
+target says 8.50 ms, five times larger. The conclusion survives the correction
+only because the headroom is large; a tighter budget would have made LK worth
+doing. Its remaining genuine case is robustness through gradual appearance
 change, which is a different argument and not one about speed.
 
-**A C++ rewrite was considered and rejected.** ORB detection, brute-force
-matching and PnP are already compiled OpenCV. Python calls into them on the order
-of a hundred times per frame, and interpreter dispatch is microseconds against
-milliseconds of native work. The measured Python overhead is the 3.5%
-`unaccounted` row, and that is an upper bound including genuine untimed work. A
-rewrite would target a few percent while discarding readability entirely.
+**A degeneracy threshold — measured and deliberately not branched on.** See
+*Measurement discipline*: 0.43–0.45 under rotation against 0.29–0.34 under
+translation, a 0.09 margin on three clips. Reported as evidence in the failure
+message; the diagnosis rests on something far more robust.
 
-**Dual-model homography/essential initialization was rejected**, as described
-under *Measurement discipline*: the signal separating the cases was measured,
-found to have a 0.09 margin on three clips, and shipped as reported evidence
-rather than as a branch.
+**A C++ rewrite — considered and rejected.** ORB detection, matching and PnP are
+already compiled OpenCV, called on the order of a hundred times per frame, and
+interpreter dispatch is microseconds against milliseconds of native work. The
+measured Python overhead is the 1.3% `unaccounted` row, an upper bound that also
+includes genuine untimed work. The real target, if this needed to be faster,
+is bundle adjustment at 59% of frame time — and the fix there is Ceres or a
+better-conditioned problem, not a different language for the glue.
 
----
+**Retuning the cull threshold on one sequence — declined.** A sweep showed
+0.5 px gives the best ATE *and* the lowest cost on fr1_xyz. Not adopted: it is
+one clip, and fitting a threshold to one clip is the failure this project has
+avoided elsewhere.
 
 ## The two things that cannot be fixed
 
@@ -511,37 +618,44 @@ as a controlled comparison.
 
 ## Limitations
 
-**Tracking loss with no relocalization.** On `fr1_xyz` tracking is lost at frame
-186 of 798 and the job returns a flagged partial trajectory. This is specified
-behaviour — stop, return what was reconstructed, flag it — but it is also the
-largest single gap between this system and a complete one, and it is why the
-headline accuracy figure covers 23.4% of a sequence rather than all of it.
+**Trajectories fragment into segments.** This is the largest one. When tracking
+cannot be recovered the pipeline restarts the map, and each segment carries its
+own arbitrary scale and origin — fr1_room needs 27 restarts to cover its
+sequence. Accuracy *within* a segment is good; the relationship *between*
+segments is unknown and unknowable from images alone. A system with working
+relocalization would rejoin them; see below.
 
-**No loop closure.** The system cannot recognise that it has returned to a place
-it has already mapped, so accumulated drift is never corrected globally.
+**Relocalization is implemented but has never succeeded.** Ablating it changes
+no measured result. The skip-and-retry path recovers first on easy sequences, and
+on hard ones the map has frozen before relocalization could help. It is reported
+as unvalidated rather than as a feature.
+
+**Loop closure is implemented but unproven.** Detection works (78 verified
+closures on fr1_xyz); the correction has not been shown to improve any measured
+trajectory, because no benchmarked sequence here has enough uncorrected drift for
+it to fix. Not claimed as a result.
+
+**Bundle adjustment cannot correct drift**, only local inconsistency — measured,
+not assumed: a global pass over all keyframes moved ATE by nothing.
 
 **No inertial fusion.** Phone IMU data would constrain rotation between frames
-and give metric scale, both of which address problems listed above. Out of scope.
+and supply metric scale, addressing two problems listed here. Out of scope.
 
-**No lens distortion correction.** Correcting it requires calibration parameters
-we do not have. Uncorrected radial distortion bends straight lines near the frame
-edge, which biases exactly the features with the most parallax information. The
-TUM `freiburg1` footage used for evaluation is *not* pre-undistorted, so the
-reported accuracy includes this effect.
+**No lens distortion correction.** Correcting it needs calibration we do not
+have. Uncorrected radial distortion bends straight lines near the frame edge,
+biasing exactly the features with the most parallax information. The fr1
+sequences used for evaluation are **not** pre-undistorted, so the reported
+accuracy includes this effect.
 
-**Sparse, not dense.** The output is a point cloud at ORB keypoints, not a
-surface or a mesh.
+**Sparse, not dense.** A point cloud at ORB keypoints, not a surface.
 
 **In-memory job state, single worker.** Jobs do not survive a restart, and state
-is process-local so the service cannot be scaled to a second replica without
-replacing `app/store.py`. Concurrency is fixed at one because the measured
-workload already stops scaling past two threads: a second concurrent job would
-not finish sooner, it would make both miss the budget.
+is process-local, so the service cannot scale to a second replica without
+replacing `app/store.py`. Concurrency is fixed at one because the workload
+already stops scaling past two threads: a second concurrent job would not finish
+sooner, it would make both miss the budget.
 
-**Duration is enforced server-side, size both.** Uploads are capped at 25 MB
-(enforced mid-stream and by nginx) and 60 seconds.
-
----
+**Uploads capped at 25 MB and 60 seconds**, enforced mid-stream and by nginx.
 
 ## Setup
 
