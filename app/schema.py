@@ -131,6 +131,10 @@ class SlamResult:
     poses: list[list[list[float]]] = field(default_factory=list)
     # Which source frame index each pose corresponds to.
     frame_indices: list[int] = field(default_factory=list)
+    # Which map segment each pose belongs to. Tracking loss can force a fresh
+    # map, and each segment carries its own arbitrary scale and origin, so poses
+    # are only directly comparable within a segment.
+    segments: list[int] = field(default_factory=list)
     # Which of those poses are keyframes, as indices into `poses`.
     keyframe_indices: list[int] = field(default_factory=list)
     # [x, y, z] per map point.
@@ -146,6 +150,8 @@ class SlamResult:
         return {
             "poses": self.poses,
             "frame_indices": self.frame_indices,
+            "segments": self.segments,
+            "n_segments": len(set(self.segments)) if self.segments else 1,
             "keyframe_indices": self.keyframe_indices,
             "points": self.points,
             "observations": self.observations,

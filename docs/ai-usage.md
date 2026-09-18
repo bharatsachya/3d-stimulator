@@ -88,3 +88,82 @@ rules) surface on day one instead of on the deadline.
 
 The page then has no external dependency at review time, and works if the
 reviewer's network blocks the CDN.
+
+---
+
+## 18 Sep 2026 — hardening pass
+
+### Rejected on measurement: projection-guided matching
+
+**Suggested and implemented.** Replace brute-force descriptor matching against
+the local map with a projection-guided search: predict the pose, project each map
+point into the image, and compare only against keypoints within a few pixels. It
+is what ORB-SLAM does and the isolated evidence was strong — at the exact frame
+where tracking died, 203 matches against brute force's 90.
+
+**Rejected.** End to end it was consistently worse: 23 poses against 59, across
+every radius and ratio tested.
+
+**Why the isolated measurement misled.** It used the *true* pose. The pipeline
+only has a *predicted* one, and constant-velocity prediction error was measured
+at a median of 8-23 px with a maximum of 165 px — so correct matches routinely
+fell outside the search disc. Two further errors surfaced while investigating:
+the radius was never the live variable (a `k=8` neighbour cap binds first, which
+is why r=30, 60 and 100 gave identical results), and the raw match counts were
+never comparable (brute force assigns several keypoints to one map point, where
+the projection matcher enforces one-to-one). Kept behind a flag, defaulted off.
+
+### Rejected: retuning the cull threshold on one sequence
+
+Sweeping it showed 0.5 px gives the best ATE and the lowest cost on fr1_xyz.
+**Not adopted.** It is one clip, and fitting a threshold to one clip is the exact
+failure this project has avoided elsewhere. What *was* adopted is the structural
+finding: at the shipped 5 px the cull removed **zero** points across the whole
+sequence, because triangulation already gates at 4 px — so it could never fire.
+
+### Corrected: a scaling bug that made bundle adjustment a no-op
+
+BA reduced reprojection error by 0.2% and recovered 0.1% of a known injected
+perturbation. The cause was `x_scale`: with isotropic scaling across a parameter
+vector mixing radians, translations and 3D coordinates, `trf` terminated after
+two evaluations believing it had converged while the gradient norm was 3143.
+With `x_scale="jac"`, recovery of the same perturbation went to 86.6%.
+
+**Recorded because of how nearly it was missed.** Three experiments varying
+`diff_step`, tolerances and `x_scale` all returned byte-identical results, which
+read as evidence that none of them mattered. They were no-ops — `ba.py` imports
+`least_squares` by name, so patching `scipy.optimize.least_squares` never touched
+it. *Identical numbers across varied inputs indicate a broken experiment, not an
+insensitive system.*
+
+### Modified: scikit-learn was specified for the loop-closure vocabulary
+
+The brief asked for `sklearn.MiniBatchKMeans` to cluster ORB descriptors.
+**Used `cv2.kmeans` instead.** OpenCV is already a dependency and this project's
+entire argument is about what fits in a constrained compute budget; adding a
+large dependency for one function call would sit badly with that. No accuracy
+claim is made either way — it is a dependency decision, not a numerical one, and
+the binary-descriptor caveat (k-means on binary data treated as floats is an
+approximation to DBoW2's k-majority) is documented in `vslam/bow.py`.
+
+### Corrected: figures quoted from the laptop rather than the target
+
+The brief restated per-stage timings that were the development laptop's
+(`match_map` 1.61 ms, 7.2%). On the deployment instance the same stage measures
+6.62 ms and 27.4% — four times larger. The Lucas-Kanade rejection still holds,
+but on a corrected premise, and the README says so.
+
+### Corrected: an assumption about how drift grows
+
+The brief stated drift is superlinear and that full-sequence error would exceed
+four times the measured figure. Measured over growing prefixes, ATE fits
+`path^0.46` — sublinear, with the error *fraction* falling. The README refuses to
+extrapolate in either direction, because 23% of one confined sequence supports
+neither claim.
+
+### The honest ablation
+
+Skip-and-retry plus relocalization took coverage on fr1_xyz from 22.7% to 99.7%.
+Ablating `relocalize()` entirely changed **nothing** — it had never once
+succeeded. The whole gain came from not giving up after a single failed frame.
+Reported that way rather than crediting the more sophisticated component.

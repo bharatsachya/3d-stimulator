@@ -77,6 +77,7 @@ def to_slam_result(result: PipelineResult) -> SlamResult:
 
     return SlamResult(
         poses=poses,
+        segments=[int(p.segment) for p in result.poses],
         frame_indices=frame_indices,
         keyframe_indices=keyframe_indices,
         points=points,

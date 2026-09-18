@@ -34,6 +34,7 @@ from app.schema import FailureReason, ResultFlag, SlamFailure
 from vslam.ba import run_bundle_adjustment
 from vslam.camera import Camera
 from vslam.features import FeatureExtractor, Matcher
+from vslam.loop import detect_loops, optimize_pose_graph
 from vslam.initialize import SEARCH_WINDOW, initialize, try_initialize
 from vslam.mapping import Map, triangulate
 from vslam.timing import StageTimer
@@ -99,6 +100,10 @@ class TrackedPose:
     t: np.ndarray
     is_keyframe: bool = False
     n_inliers: int = 0
+    # Which map segment this pose belongs to. See the note on re-initialization
+    # in run_pipeline: each segment has its own arbitrary scale and origin, so
+    # poses are only comparable with others carrying the same segment number.
+    segment: int = 0
 
 
 @dataclass
@@ -155,6 +160,11 @@ def run_pipeline(
     cull_window_keyframes: int = 8,
     enable_relocalization: bool = True,
     max_consecutive_lost_frames: int = 60,
+    # Re-initialize a fresh map after this many consecutive unrecoverable
+    # frames. See the block comment where this is used.
+    enable_reinitialization: bool = True,
+    frames_before_reinitialization: int = 12,
+    enable_loop_closure: bool = False,
     enable_bundle_adjustment: bool = True,
     ba_window: int = 5,
     # Every SECOND keyframe, not every one. Measured end to end on TUM fr1_xyz:
@@ -187,6 +197,9 @@ def run_pipeline(
     older_R = older_t = None
     lost_at_frame: int | None = None
     consecutive_lost = 0
+    segment = 0
+    segment_starts: list[dict] = []
+    all_maps: list = []
     relocalizations: list[dict] = []
     ba_runs: list[dict] = []
     keyframes_since_ba = 0
@@ -243,11 +256,21 @@ def run_pipeline(
 
                 if result is None:
                     if len(initialization_buffer) > SEARCH_WINDOW:
-                        # The window is exhausted. Re-run over the whole buffer
-                        # purely to raise a properly diagnosed failure, which
-                        # distinguishes "no texture" from "no translation".
-                        with timer.stage("initialize"):
-                            initialize(initialization_buffer, matcher, camera)
+                        if segment == 0:
+                            # The FIRST initialization failing means the video
+                            # cannot be reconstructed at all. Re-run over the
+                            # whole buffer purely to raise a properly diagnosed
+                            # failure, distinguishing "no texture" from "no
+                            # translation".
+                            with timer.stage("initialize"):
+                                initialize(initialization_buffer, matcher, camera)
+                        else:
+                            # A LATER segment failing is not fatal: earlier
+                            # segments are valid results that must not be thrown
+                            # away. Slide the buffer forward and keep trying, so
+                            # a stretch of unreconstructable video is skipped
+                            # rather than ending the run.
+                            initialization_buffer = initialization_buffer[-2:]
                     continue
 
                 world_map = result.world_map
@@ -260,6 +283,7 @@ def run_pipeline(
                         reference_keyframe.R,
                         reference_keyframe.t,
                         is_keyframe=True,
+                        segment=segment,
                     )
                 )
                 poses.append(
@@ -269,8 +293,11 @@ def run_pipeline(
                         current_keyframe.t,
                         is_keyframe=True,
                         n_inliers=result.n_inliers,
+                        segment=segment,
                     )
                 )
+                if world_map not in all_maps:
+                    all_maps.append(world_map)
                 previous_R, previous_t = current_keyframe.R, current_keyframe.t
                 last_keyframe_id = current_keyframe.id
                 frames_since_keyframe = 0
@@ -350,6 +377,48 @@ def run_pipeline(
                     lost_frames += 1
                     if lost_since is None:
                         lost_since = frame.index
+
+                    # ----------------------------------------------------------
+                    # RE-INITIALIZE RATHER THAN GIVE UP.
+                    #
+                    # Measured across the TUM benchmark, skip-and-retry alone
+                    # reaches 99.7% coverage on fr1_xyz but only 6-11% on desk,
+                    # desk2, room and fr2_desk. The reason is a death spiral: the
+                    # map cannot grow while tracking is lost, because keyframes
+                    # are only inserted from tracked frames -- so a camera that
+                    # explores AWAY from its initial map can never re-acquire it,
+                    # and waiting is futile. fr1_xyz only survives because its
+                    # camera oscillates in one small volume and keeps coming back.
+                    #
+                    # So after a short wait we start a fresh map from the current
+                    # frames and carry on. The new segment has its OWN arbitrary
+                    # scale and origin -- monocular scale is unobservable, and
+                    # nothing links the new segment's units to the old one's. The
+                    # segment number is recorded on every pose and evaluation
+                    # aligns each segment separately. That is an honest
+                    # representation of what a monocular system can know after
+                    # losing track, not a stitched trajectory pretending to a
+                    # continuity it cannot establish.
+                    # ----------------------------------------------------------
+                    if (
+                        enable_reinitialization
+                        and consecutive_lost >= frames_before_reinitialization
+                    ):
+                        segment += 1
+                        segment_starts.append(
+                            {"segment": segment, "frame_index": frame.index,
+                             "lost_since": lost_since}
+                        )
+                        initialized = False
+                        initialization_buffer = [(frame, features)]
+                        world_map = Map()
+                        previous_R = previous_t = None
+                        older_R = older_t = None
+                        consecutive_lost = 0
+                        lost_since = None
+                        keyframes_since_ba = 0
+                        continue
+
                     if consecutive_lost >= max_consecutive_lost_frames:
                         lost_at_frame = frame.index
                         flags.append(ResultFlag.TRACKING_LOST.value)
@@ -375,7 +444,8 @@ def run_pipeline(
 
             poses.append(
                 TrackedPose(
-                    frame.index, tracked.R, tracked.t, n_inliers=tracked.n_inliers
+                    frame.index, tracked.R, tracked.t,
+                    n_inliers=tracked.n_inliers, segment=segment,
                 )
             )
             older_R, older_t = previous_R, previous_t
@@ -488,6 +558,21 @@ def run_pipeline(
             "the video ended before a usable pair of frames was found",
         )
 
+    # Loop closure runs once after tracking, over the finished map. See
+    # vslam/loop.py for why this is offline rather than online.
+    loop_result = None
+    if enable_loop_closure and world_map.n_keyframes > 20:
+        loop_result = optimize_pose_graph(
+            world_map, detect_loops(world_map, camera, matcher)[0]
+        )
+        if loop_result.optimized:
+            # Keyframe poses moved, so the emitted trajectory must follow them.
+            for pose in poses:
+                for keyframe in world_map.keyframes.values():
+                    if keyframe.frame_index == pose.frame_index:
+                        pose.R, pose.t = keyframe.R, keyframe.t
+                        break
+
     if world_map.n_points < 50:
         flags.append(ResultFlag.FEW_MAP_POINTS.value)
     if relocalizations:
@@ -499,16 +584,23 @@ def run_pipeline(
         "camera": camera.to_dict(),
         "focal_source": "user override" if focal_px is not None else "heuristic 0.9*width",
         "n_poses": len(poses),
-        "n_keyframes": world_map.n_keyframes,
-        "n_map_points": world_map.n_points,
+        "n_keyframes": sum(m.n_keyframes for m in all_maps) or world_map.n_keyframes,
+        "n_map_points": sum(m.n_points for m in all_maps) or world_map.n_points,
         "mean_reprojection_error_px": round(
             world_map.mean_reprojection_error(camera), 3
         ),
         "tracking_lost_at_frame": lost_at_frame,
+        "n_segments": segment + 1,
+        "segment_starts": segment_starts,
         "n_ba_runs": len(ba_runs),
         "ba_mean_ms": round(float(np.mean([b["ms"] for b in ba_runs])), 2) if ba_runs else 0.0,
         "ba_mean_error_before_px": round(float(np.mean([b["error_before_px"] for b in ba_runs])), 4) if ba_runs else 0.0,
         "ba_mean_error_after_px": round(float(np.mean([b["error_after_px"] for b in ba_runs])), 4) if ba_runs else 0.0,
+        "loop_candidates": len(loop_result.candidates) if loop_result else 0,
+        "loops_accepted": len(loop_result.accepted) if loop_result else 0,
+        "loop_optimized": bool(loop_result.optimized) if loop_result else False,
+        "loop_error_before": round(loop_result.error_before, 4) if loop_result else 0.0,
+        "loop_error_after": round(loop_result.error_after, 4) if loop_result else 0.0,
         "n_relocalizations": len(relocalizations),
         "relocalizations": relocalizations,
         "frames_lost": lost_frames,
