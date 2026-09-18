@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from app.schema import FailureReason, ResultFlag, SlamFailure
+from vslam.ba import run_bundle_adjustment
 from vslam.camera import Camera
 from vslam.features import FeatureExtractor, Matcher
 from vslam.initialize import SEARCH_WINDOW, initialize, try_initialize
@@ -154,6 +155,15 @@ def run_pipeline(
     cull_window_keyframes: int = 8,
     enable_relocalization: bool = True,
     max_consecutive_lost_frames: int = 60,
+    enable_bundle_adjustment: bool = True,
+    ba_window: int = 5,
+    # Every SECOND keyframe, not every one. Measured end to end on TUM fr1_xyz:
+    # every keyframe at nfev=50 costs 106 ms/frame -- over the 100 ms budget --
+    # and is WORSE (0.57% of path) than every second keyframe at 70.8 ms/frame
+    # (0.45%). More optimisation is not monotonically better when it competes
+    # with the frames that feed it.
+    ba_every_n_keyframes: int = 2,
+    ba_max_nfev: int = 50,
 ) -> PipelineResult:
     timer = StageTimer()
     extractor = FeatureExtractor(n_features)
@@ -178,6 +188,8 @@ def run_pipeline(
     lost_at_frame: int | None = None
     consecutive_lost = 0
     relocalizations: list[dict] = []
+    ba_runs: list[dict] = []
+    keyframes_since_ba = 0
     lost_frames = 0
     lost_since: int | None = None
 
@@ -430,6 +442,29 @@ def run_pipeline(
                     world_map, last_keyframe, keyframe, matcher, camera
                 )
 
+            keyframes_since_ba += 1
+            if (
+                enable_bundle_adjustment
+                and keyframes_since_ba >= ba_every_n_keyframes
+            ):
+                with timer.stage("bundle_adjustment"):
+                    ba = run_bundle_adjustment(
+                        world_map, camera, window=ba_window, max_nfev=ba_max_nfev
+                    )
+                keyframes_since_ba = 0
+                if ba.ran:
+                    ba_runs.append(
+                        {
+                            "keyframe": keyframe.id,
+                            "error_before_px": round(ba.error_before_px, 4),
+                            "error_after_px": round(ba.error_after_px, 4),
+                            "n_points": ba.n_points,
+                            "n_residuals": ba.n_residuals,
+                            "iterations": ba.iterations,
+                            "ms": round(ba.milliseconds, 2),
+                        }
+                    )
+
             with timer.stage("cull"):
                 n_culled = world_map.cull(
                     camera,
@@ -470,6 +505,10 @@ def run_pipeline(
             world_map.mean_reprojection_error(camera), 3
         ),
         "tracking_lost_at_frame": lost_at_frame,
+        "n_ba_runs": len(ba_runs),
+        "ba_mean_ms": round(float(np.mean([b["ms"] for b in ba_runs])), 2) if ba_runs else 0.0,
+        "ba_mean_error_before_px": round(float(np.mean([b["error_before_px"] for b in ba_runs])), 4) if ba_runs else 0.0,
+        "ba_mean_error_after_px": round(float(np.mean([b["error_after_px"] for b in ba_runs])), 4) if ba_runs else 0.0,
         "n_relocalizations": len(relocalizations),
         "relocalizations": relocalizations,
         "frames_lost": lost_frames,
