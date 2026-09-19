@@ -283,10 +283,18 @@ Deployment fails for reasons unrelated to SLAM (security groups, wheel builds,
 firewall rules) and that risk is worth retiring on day one. The real worker drops
 into the same seam at stage 7.
 
-### HTTPS is not on the critical path
-With no cross-origin frontend there is no mixed-content problem, so plain HTTP on
-the elastic IP is sufficient for the deliverable. A certificate (DuckDNS +
-certbot) is an end-of-build nicety, attempted only once the pipeline exists.
+### HTTPS -- done, after the pipeline
+Plain HTTP was sufficient for the deliverable, since a same-origin frontend has
+no mixed-content problem, so this was deliberately left until the pipeline
+existed. It is now served over TLS at https://13.63.181.231.sslip.io/.
+
+A publicly-trusted certificate cannot be issued for a bare IP by the ordinary
+ACME path, so HTTPS needs a hostname. sslip.io resolves 13.63.181.231.sslip.io
+to 13.63.181.231 by construction with no registration, which satisfies Let's
+Encrypt's HTTP-01 challenge. The nginx server blocks live in deploy/nginx.conf
+rather than being written by `certbot --nginx`: the config is redeployed from
+the repository, so a hand-edit on the box would be silently reverted and TLS
+would break with no obvious cause.
 
 ### Instance isolation
 SLAM gets its **own** `m7i-flex.large`. It does not share 2 vCPUs with any other

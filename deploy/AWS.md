@@ -177,12 +177,37 @@ for the account you are launching in rather than assuming either way.
 
 ---
 
-## 6. HTTPS — deliberately last
+## 6. HTTPS
 
-Plain HTTP is sufficient for this deliverable. The frontend is served by the
-same origin as the API, so there is no cross-origin fetch and therefore no
-mixed-content blocking — the thing that would have forced TLS onto the critical
-path had the UI been hosted separately.
+Served at **https://13.63.181.231.sslip.io/**, with HTTP redirecting to it.
 
-If time allows at the end: point a DuckDNS subdomain at the elastic IP and run
-`certbot --nginx`. Do not do this before the pipeline exists.
+A publicly-trusted certificate is not issued for a bare IP address by the
+ordinary ACME path, so TLS needs a DNS name. `sslip.io` is a free wildcard
+resolver requiring no registration or account: `13.63.181.231.sslip.io` resolves
+to `13.63.181.231` by construction, which is all Let's Encrypt's HTTP-01
+challenge needs.
+
+```bash
+sudo apt-get install -y certbot python3-certbot-nginx
+sudo certbot certonly --nginx -d 13.63.181.231.sslip.io \
+  --non-interactive --agree-tos --register-unsafely-without-email
+sudo cp deploy/nginx.conf /etc/nginx/sites-available/slam
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+`certonly`, not `--nginx`, is deliberate. Letting certbot rewrite the live nginx
+config would work once and then break silently: this repository redeploys
+`deploy/nginx.conf` over it, reverting the TLS server block with no obvious
+cause. The config is the source of truth; certbot only obtains the certificate.
+
+Two things that cost time here and are worth knowing:
+
+- `http2 on;` is nginx 1.25.1+ syntax. Ubuntu 24.04 ships **1.24.0**, where it
+  fails validation outright with `unknown directive "http2"`. Use
+  `listen 443 ssl http2;`.
+- The port-80 server block must serve `/.well-known/acme-challenge/` **before**
+  redirecting to HTTPS. Renewal uses HTTP-01 over port 80, so a blanket redirect
+  makes the certificate stop renewing in 60 days, long after anyone is watching.
+
+Renewal is handled by the `certbot.timer` systemd unit installed with the
+package; verify with `sudo certbot renew --dry-run`.

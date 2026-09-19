@@ -4,7 +4,7 @@ Upload a video from a single ordinary camera and get back the estimated camera
 trajectory and a sparse 3D point cloud, rendered in an orbitable 3D view with a
 measured per-stage timing breakdown. It runs on two free-tier vCPUs with no GPU.
 
-**Live:** http://13.63.181.231/
+**Live:** https://13.63.181.231.sslip.io/
 
 ---
 
