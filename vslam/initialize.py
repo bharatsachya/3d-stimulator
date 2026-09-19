@@ -62,6 +62,45 @@ RANSAC_CONFIDENCE = 0.999
 SEARCH_WINDOW = 30
 MAX_REPROJECTION_PX = 4.0
 
+# ---------------------------------------------------------------------------
+# Static-camera detection
+# ---------------------------------------------------------------------------
+#
+# A fixed camera on a highway overpass produced a plausible-looking result
+# instead of a diagnosis. The camera never moved; the only motion was traffic.
+#
+# The parallax gate could not catch this, and the reason is conceptual rather
+# than a coding error. The gate measures APPARENT feature motion, and apparent
+# motion has two possible causes: a moving camera in a static scene, or a static
+# camera with independently moving objects. Nothing in a feature displacement
+# distinguishes them, and the cars supplied enough apparent motion to read as
+# camera translation.
+#
+# What DOES distinguish them is the shape of the distribution. A translating
+# camera moves everything, by varying amounts. A fixed camera moves nothing
+# except the handful of features attached to whatever is passing through.
+#
+# Measured as "fraction of matched features that moved less than one pixel",
+# taken across all 30 candidate initialization pairs, on the target instance:
+#
+#     clip            min      median
+#     cars            49%      77%
+#     synth_dolly      0%       0%
+#     synth_rotate     0%       0%
+#     fr1_xyz          0%       0%
+#     fr1_desk         0%       0%
+#     fr1_desk2        0%       0%
+#     fr1_room         0%       0%
+#     fr2_desk         0%       1%
+#
+# Every valid clip sits at zero. The static-camera clip sits at 49% in its most
+# favourable pair. The threshold below is placed in the middle of a 48-point
+# gap, which is the opposite situation to the homography degeneracy ratio --
+# measured at 0.43-0.45 against 0.29-0.34, a 0.09 margin, and deliberately NOT
+# branched on. This margin is wide enough to gate on; that one was not.
+STATIC_DISPLACEMENT_PX = 1.0
+MAX_STATIC_FRACTION = 0.25
+
 
 class Rejection:
     """
@@ -78,6 +117,7 @@ class Rejection:
     TOO_FEW_INLIERS = "too_few_inliers"
     TOO_FEW_TRIANGULATED = "too_few_triangulated"
     TOO_LITTLE_PARALLAX = "too_little_parallax"
+    STATIC_CAMERA = "static_camera"
 
 
 @dataclass
@@ -89,6 +129,9 @@ class InitializationResult:
     n_inliers: int
     n_points: int
     attempts: int
+    # Reported, never gated on. See homography_dominance for the measurement
+    # that settled that, and degenerate_geometry_warning for what is done with it.
+    homography_dominance: float = 0.0
 
 
 def try_initialize(
@@ -114,6 +157,15 @@ def try_initialize(
 
     points_reference = reference_features.points[query_indices]
     points_candidate = candidate_features.points[train_indices]
+
+    # Reject a pair whose features mostly did not move. See the module-level
+    # note: this is checked BEFORE the essential matrix, because on a static
+    # camera findEssentialMat will happily fit the moving objects' motion and
+    # report it as the camera's.
+    displacement = np.linalg.norm(points_candidate - points_reference, axis=1)
+    static_fraction = float((displacement < STATIC_DISPLACEMENT_PX).mean())
+    if static_fraction > MAX_STATIC_FRACTION:
+        return None, Rejection.STATIC_CAMERA, 0.0
 
     # The essential matrix encodes the epipolar geometry between two calibrated
     # views. RANSAC because the matches still contain outliers even after the
@@ -210,6 +262,9 @@ def try_initialize(
             n_inliers=int(inlier_mask.sum()),
             n_points=world_map.n_points,
             attempts=0,
+            homography_dominance=homography_dominance(
+                points_reference, points_candidate
+            ),
         ),
         "",
         parallax,
@@ -240,18 +295,29 @@ def homography_dominance(
     This is the same model-selection idea ORB-SLAM uses to choose between a
     homography and a fundamental matrix at initialization.
 
-    IT IS REPORTED, NOT BRANCHED ON. Measured across the test clips:
+    IT IS REPORTED, NEVER BRANCHED ON, AND THE EVIDENCE FOR THAT GOT STRONGER.
 
-        pure rotation   0.43 - 0.45
-        translation     0.29 - 0.34
+    First measured on three clips: rotation 0.43-0.45, translation 0.29-0.34, a
+    margin of about 0.09 -- judged too thin to gate on. Re-measured across nine
+    clips and 226 candidate pairs on the target instance, the margin is
+    NEGATIVE:
 
-    The signal is real but the margin is about 0.09, because findFundamentalMat
-    still finds plenty of degenerate "inliers" on rotation-only correspondences,
-    which compresses the ratio well below the 1.0 that theory suggests. A
-    threshold picked inside a margin that thin, on a handful of clips, would be
-    tuning by intuition on weak evidence -- so this number is included in the
-    failure message as supporting detail and the diagnosis itself rests on
-    something far more robust: whether there were matches at all.
+        pure rotation    min 0.400   median 0.446   max 0.458
+        static camera    min 0.396   median 0.471   max 0.485
+        valid clips      min 0.000   median 0.314   max 0.429
+
+    Rotation's minimum (0.400) falls BELOW the valid maximum (0.429): the
+    distributions overlap, and no per-pair threshold separates them. More data
+    made the case for gating worse, which is the usual direction when a margin
+    was thin to begin with.
+
+    There is a second, independent reason never to gate on it. A homography
+    explains correspondences under pure rotation OR when the scene is planar,
+    and a planar scene filmed by a TRANSLATING camera -- a desk filling the
+    frame, a road surface -- is a perfectly valid input. Gating here would
+    reject it for being flat.
+
+    So the value is surfaced as a confidence warning on the result instead.
     """
     if len(points_a) < 8:
         return 0.0
@@ -271,6 +337,19 @@ def homography_dominance(
     if total == 0:
         return 0.0
     return homography_inliers / total
+
+
+def degenerate_geometry_warning(dominance: float) -> bool:
+    """
+    Whether the geometry looks degenerate enough to warn about.
+
+    A WARNING, NOT A GATE. The threshold is the midpoint between the valid
+    clips' median (0.314) and the rotation/static clips' median (0.446-0.471).
+    Because the per-pair distributions overlap, crossing it means "this
+    reconstruction deserves suspicion", never "this input is invalid" -- and the
+    result is still produced, still rendered, and labelled.
+    """
+    return dominance >= 0.40
 
 
 def initialize(
@@ -296,6 +375,7 @@ def initialize(
     best_parallax = 0.0
     rejections: dict[str, int] = {}
     match_counts: list[int] = []
+    static_fractions: list[float] = []
     # Keep the widest-baseline candidate's correspondences for the degeneracy
     # test below. The last candidate in the window is the furthest in time and
     # so the most likely to show translation if there is any.
@@ -322,6 +402,15 @@ def initialize(
         )
         match_counts.append(len(query_indices))
         if len(query_indices) >= 8:
+            displacement = np.linalg.norm(
+                features.points[train_indices]
+                - reference_features.points[query_indices],
+                axis=1,
+            )
+            static_fractions.append(
+                float((displacement < STATIC_DISPLACEMENT_PX).mean())
+            )
+        if len(query_indices) >= 8:
             last_correspondence = (
                 reference_features.points[query_indices],
                 features.points[train_indices],
@@ -338,6 +427,21 @@ def initialize(
             f"too few reliable correspondences across {attempts} candidate pairs "
             f"(median {median_matches:.0f}, need {MIN_ESSENTIAL_INLIERS}); the scene "
             f"likely has too little texture, or the footage is motion-blurred",
+        )
+
+    # Case 1b: the camera itself never moved. Checked before the parallax case
+    # because it is a strict subset of it -- a static camera trivially has no
+    # parallax -- but the advice differs completely, and "walk sideways past the
+    # subject" is useless to someone whose camera is bolted to a bridge.
+    if static_fractions and min(static_fractions) > MAX_STATIC_FRACTION:
+        raise SlamFailure(
+            FailureReason.STATIC_CAMERA,
+            f"the camera does not appear to have moved: across {attempts} candidate "
+            f"pairs, at best {min(static_fractions) * 100:.0f}% and typically "
+            f"{float(np.median(static_fractions)) * 100:.0f}% of matched features "
+            f"stayed within {STATIC_DISPLACEMENT_PX:.0f} px, while a minority moved "
+            f"far. That is a fixed camera observing independent motion, not a "
+            f"camera travelling through a scene",
         )
 
     # Case 2: there were plenty of matches, so the scene has texture and the

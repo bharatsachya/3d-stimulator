@@ -146,3 +146,17 @@ button.again:hover { border-color: var(--accent); }
   margin: 0; padding: 2rem 1.25rem;
   color: var(--muted); font-size: .88rem; text-align: center;
 }
+
+/* ---------- Confidence ---------- */
+
+.confidence-heading {
+  margin: 1.25rem 0 .5rem; font-size: .78rem; font-weight: 600;
+  color: var(--muted); text-transform: uppercase; letter-spacing: .05em;
+}
+table.confidence { width: 100%; border-collapse: collapse; font-size: .84rem; }
+table.confidence td { padding: .4rem .55rem; border-bottom: 1px solid var(--line); text-align: left; }
+table.confidence td.value { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.confidence td.why { color: var(--muted); font-size: .78rem; }
+/* A concerning signal is marked, not hidden. */
+table.confidence tr.concern td { color: #e3b341; }
+table.confidence tr.concern td.why { color: #b99230; }

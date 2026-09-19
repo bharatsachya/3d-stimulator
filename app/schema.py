@@ -37,6 +37,13 @@ class FailureReason(str, Enum):
     # The camera rotated but never translated. No parallax, so no depth, so no
     # map. This is the documented pure-rotation failure mode.
     INSUFFICIENT_PARALLAX = "insufficient_parallax"
+    # The camera did not move AT ALL; the only motion in frame belongs to
+    # objects moving through a static scene. Distinct from INSUFFICIENT_PARALLAX
+    # because the remedy is different: a rotating camera needs to travel, a
+    # bolted-down camera needs to be picked up.
+    STATIC_CAMERA = "static_camera"
+    # Everything ran, and produced nothing worth showing.
+    DEGENERATE_RECONSTRUCTION = "degenerate_reconstruction"
     # Parallax was adequate but too few correspondences survived the essential
     # matrix. Usually low texture or motion blur.
     INITIALIZATION_FAILED = "initialization_failed"
@@ -58,6 +65,8 @@ class ResultFlag(str, Enum):
     RELOCALIZED = "relocalized"
     FEW_MAP_POINTS = "few_map_points"
     BA_SKIPPED_FOR_TIME = "ba_skipped_for_time"
+    LOW_CONFIDENCE = "low_confidence"
+    DEGENERATE_GEOMETRY = "degenerate_geometry"
 
 
 # Every reason rendered as something a person can act on. Kept beside the enum
@@ -73,6 +82,19 @@ FAILURE_MESSAGES: dict[FailureReason, str] = {
         "Not enough parallax - the camera may have rotated in place rather than "
         "moving through the scene. A single lens recovers depth only from motion "
         "that changes viewpoint, so try walking sideways past the subject."
+    ),
+    FailureReason.STATIC_CAMERA: (
+        "The camera does not appear to have moved. Most features stayed in exactly "
+        "the same place, while a few moved a long way - the signature of a fixed "
+        "camera watching things move past it. A single lens recovers depth from "
+        "the CAMERA changing position, so filming moving subjects from a tripod, "
+        "a window or a mount cannot work no matter how much motion is in frame. "
+        "Carry the camera through the scene instead."
+    ),
+    FailureReason.DEGENERATE_RECONSTRUCTION: (
+        "Processing finished but produced no usable 3D structure. Rather than "
+        "show you a picture that looks like a reconstruction but is not one, "
+        "this is being reported as a failure."
     ),
     FailureReason.INITIALIZATION_FAILED: (
         "Could not establish an initial map. This usually means too little texture "
@@ -94,6 +116,18 @@ FLAG_MESSAGES: dict[ResultFlag, str] = {
     ResultFlag.FEW_MAP_POINTS: (
         "The map is sparse, so the point cloud may look thin. More texture in the "
         "scene usually helps."
+    ),
+    ResultFlag.LOW_CONFIDENCE: (
+        "Low confidence: tracking was repeatedly lost and the map restarted many "
+        "times for the number of poses recovered. Treat the shape of this "
+        "reconstruction with suspicion."
+    ),
+    ResultFlag.DEGENERATE_GEOMETRY: (
+        "The scene geometry is close to degenerate: the views are nearly as well "
+        "explained by a flat surface or a rotation as by camera travel. This "
+        "happens with mostly-planar scenes and with cameras that turn more than "
+        "they move, and it makes depth poorly conditioned. The reconstruction is "
+        "shown, but treat its shape with caution."
     ),
     ResultFlag.BA_SKIPPED_FOR_TIME: (
         "Bundle adjustment was run less often than usual to stay within the time "

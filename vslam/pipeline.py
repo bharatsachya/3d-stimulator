@@ -35,7 +35,12 @@ from vslam.ba import run_bundle_adjustment
 from vslam.camera import Camera
 from vslam.features import FeatureExtractor, Matcher
 from vslam.loop import detect_loops, optimize_pose_graph
-from vslam.initialize import SEARCH_WINDOW, initialize, try_initialize
+from vslam.initialize import (
+    SEARCH_WINDOW,
+    degenerate_geometry_warning,
+    initialize,
+    try_initialize,
+)
 from vslam.mapping import Map, triangulate
 from vslam.timing import StageTimer
 from vslam.tracking import relocalize, should_insert_keyframe, track_frame
@@ -79,6 +84,11 @@ def predict_pose(
     predicted = delta @ T_current
     return predicted[:3, :3], predicted[:3, 3]
 
+
+# Below this many map points, the run has not reconstructed anything and must
+# say so rather than render it. Deliberately low: the purpose is to catch a
+# non-result, not to judge a thin one, which is what FEW_MAP_POINTS flags.
+MIN_POINTS_FOR_A_RESULT = 25
 
 # How many recent keyframes supply the map points a frame is matched against.
 # Bounded so per-frame matching cost stays flat as the map grows.
@@ -204,6 +214,8 @@ def run_pipeline(
     # Enough frames to cover the initialization search window before committing.
     initialization_buffer: list = []
     initialized = False
+    initialization_parallax = 0.0
+    initialization_dominance = 0.0
     last_keyframe_id = 0
     frames_since_keyframe = 0
     previous_R = previous_t = None
@@ -289,6 +301,9 @@ def run_pipeline(
 
                 world_map = result.world_map
                 initialized = True
+                if segment == 0:
+                    initialization_parallax = result.parallax_degrees
+                    initialization_dominance = result.homography_dominance
                 reference_keyframe = world_map.keyframes[0]
                 current_keyframe = world_map.keyframes[1]
                 poses.append(
@@ -593,10 +608,64 @@ def run_pipeline(
                         pose.R, pose.t = keyframe.R, keyframe.t
                         break
 
+    # ------------------------------------------------------------------
+    # NO SILENT PLAUSIBLE OUTPUT.
+    #
+    # A fixed camera on an overpass reached this point reporting SUCCESS with
+    # 35 poses, 11 segments and ZERO map points, mean reprojection error `nan`,
+    # and a cosmetic "the map is sparse" flag. The viewer dutifully drew the
+    # bare keyframe frusta, sized from a bounding box spanning eleven disjoint
+    # segments at unrelated scales, which is where the "long rays fanning out"
+    # came from.
+    #
+    # Nothing in the pipeline checked that the run had produced a
+    # reconstruction. Initialization was checked, tracking was checked, but the
+    # FINAL RESULT was not. A result that looks reasonable and is wrong is the
+    # worst failure this system can have, because a reviewer who does not know
+    # what a correct point cloud looks like will believe it.
+    # ------------------------------------------------------------------
+    total_points = sum(m.n_points for m in all_maps) if all_maps else world_map.n_points
+
+    if total_points < MIN_POINTS_FOR_A_RESULT:
+        raise SlamFailure(
+            FailureReason.DEGENERATE_RECONSTRUCTION,
+            f"the run finished with {total_points} map points across "
+            f"{segment + 1} segment(s) and {len(poses)} poses, which is not a "
+            f"reconstruction. Refusing to render geometry that would look like "
+            f"one",
+        )
+
+    # Reprojection error across every segment that actually holds points.
+    #
+    # Reading it from `world_map` alone was wrong: world_map is the LAST
+    # segment's map, and the last segment routinely ends mid-initialization
+    # when the video simply runs out. That map is legitimately empty, its mean
+    # error is nan, and checking it condemned fr1_desk2 -- a sequence with 3015
+    # points across 13 healthy segments -- as a degenerate reconstruction.
+    populated = [m for m in (all_maps or [world_map]) if m.n_points]
+    errors = [
+        m.mean_reprojection_error(camera)
+        for m in populated
+    ]
+    finite = [e for e in errors if np.isfinite(e)]
+    if not finite:
+        raise SlamFailure(
+            FailureReason.DEGENERATE_RECONSTRUCTION,
+            "no segment has a finite reprojection error, meaning no map point is "
+            "consistently observed by the keyframes that created it",
+        )
+    reprojection = float(np.mean(finite))
+
     if world_map.n_points < 50:
         flags.append(ResultFlag.FEW_MAP_POINTS.value)
     if relocalizations:
         flags.append(ResultFlag.RELOCALIZED.value)
+    if degenerate_geometry_warning(initialization_dominance):
+        flags.append(ResultFlag.DEGENERATE_GEOMETRY.value)
+    # Many segments over few poses means the system kept re-initializing and
+    # losing tracking again -- thrashing, not reconstructing.
+    if segment + 1 >= 4 and len(poses) < 20 * (segment + 1):
+        flags.append(ResultFlag.LOW_CONFIDENCE.value)
 
     timing = timer.report(frames=len(poses))
     stats = {
@@ -606,9 +675,14 @@ def run_pipeline(
         "n_poses": len(poses),
         "n_keyframes": sum(m.n_keyframes for m in all_maps) or world_map.n_keyframes,
         "n_map_points": sum(m.n_points for m in all_maps) or world_map.n_points,
-        "mean_reprojection_error_px": round(
-            world_map.mean_reprojection_error(camera), 3
-        ),
+        "mean_reprojection_error_px": round(reprojection, 3),
+        # Confidence signals, surfaced on the results page rather than leaving
+        # the geometry to speak for itself.
+        "median_inliers": int(np.median([p.n_inliers for p in poses if p.n_inliers]))
+        if any(p.n_inliers for p in poses)
+        else 0,
+        "initialization_parallax_deg": round(initialization_parallax, 3),
+        "initialization_homography_dominance": round(initialization_dominance, 3),
         "tracking_lost_at_frame": lost_at_frame,
         "n_segments": segment + 1,
         "segment_starts": segment_starts,

@@ -656,3 +656,177 @@ these are unsuitable for monocular systems, since a monocular system cannot
 initialise without parallax — a property of the sensor, not the implementation
 (Mur-Artal, Montiel & Tardós, *ORB-SLAM: A Versatile and Accurate Monocular SLAM
 System*, IEEE T-RO 2015).
+
+---
+
+# The fourth failure mode: a static camera watching moving objects
+
+A reviewer uploaded `cars.mp4` — a camera fixed to a highway overpass, 1280x720,
+984 frames at 30 fps. The camera never moves. The only motion in the sequence is
+traffic passing beneath it.
+
+**It returned a plausible-looking result instead of a diagnosis**: a few camera
+frusta with long rays fanning out, rendered as though the reconstruction had
+worked. That is the worst failure this system can have, because a reviewer who
+has not seen a correct point cloud has no way to know.
+
+## What the clip actually looks like
+
+Matched-feature displacement, frame 0 against later frames, at the working
+resolution:
+
+| frame gap | matches | median | p90 | max | under 1 px |
+|---|---|---|---|---|---|
+| 3 | 358 | 0.40 px | 6.12 px | 493.99 px | 52% |
+| 30 | 202 | 0.00 px | 2.07 px | 261.44 px | 80% |
+| 60 | 69 | 0.00 px | 45.51 px | 488.59 px | 70% |
+
+Frame differencing, frame 0 against frame 30: mean absolute difference 4.61, with
+only **4.6% of pixels** changing by more than 20 levels. That 4.6% is the cars.
+
+The signature is the bimodality — a median near **zero** beside a max near
+**490 px**. A translating camera moves everything by varying amounts; a fixed
+camera moves nothing except whatever happens to be driving past.
+
+## Why the existing parallax gate could not catch it
+
+This is a genuine limitation of the check rather than a bug in it, and it is
+worth stating that way.
+
+The gate requires median parallax above 1.0°. It measures **apparent** feature
+motion, and apparent motion has two possible causes: a camera moving through a
+static scene, or a static camera with independently moving objects. Nothing in a
+displacement distribution distinguishes those two, and the cars supplied ample
+apparent motion to read as camera translation.
+
+Underneath sits a deeper assumption. **Monocular SLAM rests on a rigid, static
+world.** Features attached to moving cars violate that assumption outright, so
+`findEssentialMat` can fit the *cars'* motion and report it as the *camera's* —
+which is where the fanning rays came from. Handling this properly requires
+motion segmentation, which is out of scope here.
+
+## The statistic that does separate, measured before any gate
+
+Fraction of matched features displaced less than one pixel, across all 30
+candidate initialization pairs, measured on the target instance:
+
+| clip | min | median |
+|---|---|---|
+| **cars** | **49%** | **77%** |
+| synth_dolly | 0% | 0% |
+| synth_rotate | 0% | 0% |
+| fr1_xyz | 0% | 0% |
+| fr1_desk | 0% | 0% |
+| fr1_desk2 | 0% | 0% |
+| fr1_room | 0% | 0% |
+| fr2_desk | 0% | 1% |
+| nostructure | — (too few matches on every pair; caught by the texture gate) |
+
+Every valid clip sits at zero. The static-camera clip sits at 49% in its *most
+favourable* pair. The threshold is placed at 25%, the middle of a 48-point gap —
+the opposite situation to the homography ratio below, and the reason one is
+gated on and the other is not.
+
+## The moving-object check that was measured and NOT shipped
+
+The proposal was to examine where the essential matrix's inliers sit: if they
+cluster in a small image region, the estimate is fitting object motion rather
+than camera motion. Measured as convex-hull area of the inliers, as a fraction
+of the image:
+
+| clip | min | median | max |
+|---|---|---|---|
+| **cars** | 27.0% | **41.7%** | 51.5% |
+| synth_dolly | 26.5% | 48.8% | 62.1% |
+| fr1_xyz | 13.3% | 22.6% | 47.1% |
+| fr1_desk | 8.0% | 15.2% | 51.5% |
+| fr1_desk2 | 3.9% | 13.1% | 27.6% |
+| fr1_room | 2.6% | **9.2%** | 43.1% |
+| fr2_desk | 5.0% | 22.1% | 39.6% |
+
+**It does not separate, and the sign is backwards.** `cars` has a *larger* inlier
+hull (41.7%) than every valid sequence; `fr1_room` sits at 9.2%. A gate on "small
+hull means moving objects" would reject the good sequences and pass the bad one.
+
+The reason is instructive: on a static camera the stationary background *is* the
+inlier set. A zero-displacement correspondence is perfectly consistent with zero
+camera motion, so RANSAC keeps those matches, and they span the entire frame.
+The inliers are spread widely *because* the scene is static.
+
+## Re-measuring the homography ratio, with three times the data
+
+The degeneracy ratio was measured earlier on three clips — rotation 0.43-0.45
+against translation 0.29-0.34, a 0.09 margin — and deliberately not branched on.
+Re-measured across nine clips and 226 candidate pairs:
+
+| | min | median | max |
+|---|---|---|---|
+| pure rotation | 0.400 | 0.446 | 0.458 |
+| static camera | 0.396 | 0.471 | 0.485 |
+| valid clips | 0.000 | 0.314 | **0.429** |
+
+**The margin is now negative.** Rotation's minimum (0.400) falls below the valid
+maximum (0.429): the distributions overlap and no per-pair threshold separates
+them. More data made the case for gating *worse*, which is the usual direction
+when a margin was thin to begin with.
+
+There is a second, independent reason never to gate on it: a homography explains
+correspondences under pure rotation **or** when the scene is planar, and a planar
+scene filmed by a translating camera — a desk filling the frame, a road surface —
+is a perfectly valid input that this would reject for being flat.
+
+It is therefore surfaced as a **confidence warning** on the result, never a
+rejection.
+
+## The silent-output path, audited
+
+`cars.mp4` reached a `done` status with:
+
+| | |
+|---|---|
+| poses | 35 |
+| segments | **11** |
+| map points | **0** |
+| keyframes | 22 |
+| mean reprojection error | **nan** |
+| flags | "the map is sparse" (cosmetic) |
+
+Nothing in the pipeline checked that the run had produced a reconstruction.
+Initialization was checked and tracking was checked, but the **final result**
+never was. The frusta the reviewer saw were bare keyframe poses; the "long rays"
+were frustum wireframes scaled from a bounding box spanning eleven disjoint
+segments at unrelated arbitrary scales.
+
+Three changes followed: a run finishing with fewer than 25 map points or no
+finite reprojection error now raises `DEGENERATE_RECONSTRUCTION` rather than
+rendering; segment thrashing raises a `LOW_CONFIDENCE` flag; and the results page
+shows segment count, initialization parallax, median tracked points and mean
+reprojection error, with concerning values marked.
+
+### The fix's own regression, caught by the guard
+
+The first version of the degeneracy check read the reprojection error from
+`world_map` — the **last** segment's map. That map is legitimately empty whenever
+a video ends mid-initialization, so the check condemned **fr1_desk2**, a sequence
+with 3015 points across 13 healthy segments, as a degenerate reconstruction. The
+error is now averaged across the segments that actually hold points.
+
+## A platform-dependent weakness in the rotation gate, found while testing this
+
+`synth_rotate` — a clip whose camera centre provably never moves — is correctly
+rejected on the development laptop (ARM) and **accepted on the EC2 target**
+(x86), with the same code and the same file. Initialization reports 1.247° of
+parallax on a sequence that has none.
+
+The mechanism is fundamental, not a coding error. Under pure rotation the
+essential matrix is degenerate and `recoverPose` must still return a **unit-norm**
+translation — it has no way to express "zero baseline". The reconstruction
+therefore acquires a fake baseline, and triangulated points subtend a genuine
+ray angle between the two fake centres. Whether that fake parallax lands above or
+below the 1.0° threshold comes down to floating-point and SIMD differences
+between architectures.
+
+The clip now carries the `degenerate_geometry` warning (dominance 0.45) on the
+target, so it is no longer silent — but **the pure-rotation gate is weaker than
+previously documented**, and that is stated rather than papered over with a
+threshold the evidence above shows cannot be drawn.

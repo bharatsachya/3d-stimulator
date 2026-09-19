@@ -310,6 +310,7 @@ async function showResult(job) {
   show('result');
 
   // Stats and timings first, so they appear even if the 3D view cannot.
+  result.stats = timing.stats ?? {};
   renderStats(result);
   renderTiming(timing);
 
@@ -339,10 +340,79 @@ function renderStats(result) {
     .map(([label, value]) => `<div><dt>${label}</dt><dd>${value}</dd></div>`)
     .join('');
 
+  renderConfidence(result);
+
   const flags = document.getElementById('flags');
   flags.innerHTML = (result.flag_messages ?? [])
     .map((message) => `<div class="flag">${escapeHtml(message)}</div>`)
     .join('');
+}
+
+/*
+ * Confidence signals, displayed alongside the geometry.
+ *
+ * This exists because of a real failure: a fixed camera on a highway overpass
+ * produced a plausible-looking render -- a few frusta with rays fanning out --
+ * and nothing on the page said it was meaningless. The pipeline now refuses
+ * that case outright, but the general lesson stands: whenever a reconstruction
+ * IS shown, the page should say how much to believe it.
+ */
+function renderConfidence(result) {
+  const stats = result.stats ?? {};
+  const container = document.getElementById('confidence');
+  if (!container) return;
+
+  const segments = result.n_segments ?? 1;
+  const rows = [];
+
+  // Each row: label, value, and whether it is a concern.
+  rows.push([
+    'map segments',
+    segments,
+    segments > 5,
+    'Tracking restarted this many times. Each segment has its own arbitrary '
+      + 'scale and origin, so distances are only comparable within a segment.',
+  ]);
+  if (stats.initialization_parallax_deg !== undefined) {
+    rows.push([
+      'parallax at initialization',
+      `${Number(stats.initialization_parallax_deg).toFixed(2)}°`,
+      Number(stats.initialization_parallax_deg) < 1.5,
+      'How much viewpoint change the first two frames had. Depth is poorly '
+        + 'conditioned when this is small.',
+    ]);
+  }
+  if (stats.median_inliers) {
+    rows.push([
+      'median tracked points',
+      stats.median_inliers,
+      Number(stats.median_inliers) < 60,
+      'How many map points supported each pose. Fewer means a less constrained '
+        + 'trajectory.',
+    ]);
+  }
+  if (stats.mean_reprojection_error_px !== undefined) {
+    rows.push([
+      'mean reprojection error',
+      `${Number(stats.mean_reprojection_error_px).toFixed(2)} px`,
+      Number(stats.mean_reprojection_error_px) > 2.0,
+      'How well the 3D points explain the pixels that produced them.',
+    ]);
+  }
+
+  const concerning = rows.filter((r) => r[2]).length;
+  container.innerHTML = `
+    <h3 class="confidence-heading">
+      Confidence${concerning ? ` — ${concerning} signal${concerning > 1 ? 's' : ''} worth noting` : ''}
+    </h3>
+    <table class="confidence">
+      ${rows.map(([label, value, concern, why]) => `
+        <tr class="${concern ? 'concern' : ''}">
+          <td>${escapeHtml(label)}</td>
+          <td class="value">${escapeHtml(String(value))}</td>
+          <td class="why">${escapeHtml(why)}</td>
+        </tr>`).join('')}
+    </table>`;
 }
 
 function renderTiming(timing) {

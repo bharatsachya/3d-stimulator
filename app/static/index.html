@@ -109,6 +109,13 @@
     <div class="panel">
       <h2>Reconstruction</h2>
       <dl class="stats" id="stats"></dl>
+      <!--
+        Confidence, shown next to the geometry rather than left implicit.
+        A picture that looks like a reconstruction is convincing whether or not
+        it is one, and a reviewer who has not seen a correct point cloud has no
+        way to tell. These are the numbers that say how much to trust it.
+      -->
+      <div id="confidence"></div>
       <div id="flags"></div>
     </div>
 
