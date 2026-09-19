@@ -88,17 +88,36 @@ constrained to determinant +1 — which caught a real class of bug, described un
 
 ### Failure modes produce different advice
 
-| clip | diagnosis | what the user is told |
+Four clips that must fail, and the distinct diagnosis each produces:
+
+| clip | measured signature | what the user is told |
 |---|---|---|
 | pure rotation | median **484** matches, **0.00°** parallax | move sideways through the scene |
-| TUM `nostructure_notexture_far` | median **3** matches | the scene needs texture |
+| blank wall (fr3 `nostructure_notexture_far`) | median **3** matches | the scene needs texture |
+| **fixed camera, moving traffic** | **77%** of features moved **< 1 px**, max 490 px | the *camera* must move, not the subject |
+| finished with no structure | 0 map points, `nan` reprojection | reported as a failure, not rendered |
 
-Making these differ was deliberate work. Both look identical from outside —
-initialization fails — but *"try walking sideways"* is actively wrong advice for
-someone filming a blank wall, and *"find more texture"* is useless to someone
-standing still and turning. The pipeline separates them by how far the failure
-got: plenty of matches with no parallax means the camera did not translate;
-almost no matches means there was nothing to match.
+Making these differ is deliberate work, not formatting. All four look identical
+from outside — initialization fails — but the remedies have nothing in common.
+*"Try walking sideways"* is exactly as useless to someone whose camera is bolted
+to a bridge as it is to someone filming a blank wall.
+
+The third arrived from a reviewer, and is the most instructive. A camera fixed to
+a highway overpass returned a **plausible-looking render** — a few frusta with
+rays fanning out — instead of a diagnosis. The parallax gate could not catch it,
+for a reason that is a limitation of the check rather than a bug in it: apparent
+feature motion has two possible causes, a camera moving through a static scene or
+a static camera with objects moving past, and no displacement distribution
+distinguishes them. The traffic supplied ample apparent motion to read as camera
+translation.
+
+What does distinguish them is the *shape* of the distribution — a median near
+zero beside a maximum near 490 px. Measured across 30 candidate pairs on nine
+clips, the static clip sits at **49% of features under one pixel in its most
+favourable pair**, while every valid clip sits at **0%**. The threshold is placed
+in the middle of that 48-point gap. Full tables, including a proposed
+inlier-spread check that was measured and **rejected for having the sign
+backwards**, are in [`docs/measurements.md`](docs/measurements.md).
 
 ## Timing
 
@@ -637,6 +656,25 @@ it to fix. Not claimed as a result.
 
 **Bundle adjustment cannot correct drift**, only local inconsistency — measured,
 not assumed: a global pass over all keyframes moved ATE by nothing.
+
+**Monocular SLAM assumes a rigid, static world, and this one is no exception.**
+Independently moving objects — traffic, people, anything that moves on its own —
+violate that assumption outright, and `findEssentialMat` will happily fit *their*
+motion and report it as the camera's. A fixed-camera clip is now detected and
+refused, but a *moving* camera filming a busy scene is not: its moving features
+degrade the estimate silently. Handling this properly needs motion segmentation,
+which is out of scope.
+
+**The pure-rotation gate is platform-dependent.** A clip whose camera centre
+provably never moves is correctly rejected on an ARM laptop and **accepted on the
+x86 deployment target**, with identical code and file. Under pure rotation the
+essential matrix is degenerate and `recoverPose` must still return a unit-norm
+translation — it cannot express "zero baseline" — so the reconstruction acquires
+a fake baseline whose fake parallax lands either side of the 1.0° threshold
+depending on floating-point details. The clip carries a degeneracy warning on the
+target rather than passing silently, but the gate is weaker than a single
+threshold suggests, and the homography statistic that would strengthen it
+overlaps with valid planar scenes (see `docs/measurements.md`).
 
 **No inertial fusion.** Phone IMU data would constrain rotation between frames
 and supply metric scale, addressing two problems listed here. Out of scope.
