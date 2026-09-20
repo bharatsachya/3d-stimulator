@@ -26,3 +26,16 @@ sweep-*.json
 
 # OS
 .DS_Store
+
+# Secrets and local configuration. Nothing matching these is in the repo today;
+# the rules exist so that a deploy key or an .env dropped into the working tree
+# cannot be swept in by `git add -A`. A private key committed once is in the
+# history permanently, and rewriting history is the only way back out.
+*.pem
+*.key
+id_rsa*
+.env
+.env.local
+
+# Runtime state, if a deployment ever writes here rather than to var/.
+data/

@@ -26,6 +26,30 @@ python tools/benchmark.py --dataset-root ~/tum --out out/benchmark.json
 | fr1_room | 1362 | 99.9% | 27 | 5.92 m | 3.26 cm | **0.55%** | 55.0 |
 | fr2_desk | 2965 | 100.0% | 13 | 14.71 m | 11.75 cm | **0.80%** | 59.3 |
 
+**What "path" means here, because it is not TUM's published figure.** It is the
+ground-truth path summed *within* tracked segments, over the pose pairs actually
+evaluated — so the gaps where tracking was lost and re-initialised are excluded,
+because no estimate exists across them to be scored. TUM publishes the length of
+the whole continuous trajectory instead. For fr1_xyz those are 4.93 m here
+against **7.112 m** published, and the difference is the untracked gaps plus the
+chord shortening from integrating between evaluated poses rather than every
+frame.
+
+The two are therefore not interchangeable, and the direction matters: dividing
+by the smaller within-segment path makes every "% of path" figure in this table
+**larger** — more conservative — than it would be against TUM's full-trajectory
+length. Against the published 7.112 m, fr1_xyz's 0.32% would read as 0.22%. The
+table keeps the stricter number.
+
+One real inflation, quantified: integrating the ground truth at video frame rate
+gives 8.011 m for the full fr1_xyz sequence against TUM's 7.112 m, about **13%
+high**, from discretisation and mocap noise. It is *not* the ~3x that integrating
+the raw 100 Hz stream would produce — this pipeline never sees 100 Hz, because
+`tum_to_video.py` matches one pose per video frame within a 20 ms tolerance
+before anything is integrated. Subsampling the truth from 31 Hz to 1.6 Hz moves
+the total by under 10%, which is what rules noise accumulation out as the
+mechanism.
+
 Every sequence completes inside the 100 ms/frame budget on two vCPUs with no GPU.
 A fresh run of fr1_desk afterwards returned 100.0% coverage, 14 segments,
 2.82 cm and 0.77% against the benchmark's identical figures — accuracy is
@@ -749,7 +773,7 @@ neural network anywhere in it.
 |---|---|---|
 | opencv-python-headless | 4.14.0.94 | ORB, matching, essential matrix, PnP, triangulation, video decode |
 | numpy | 2.5.3 | array arithmetic throughout |
-| scipy | 1.18.1 | bundle adjustment solver (designed; not yet wired in) |
+| scipy | 1.18.1 | sliding-window bundle adjustment: `least_squares`, `method="trf"`, Huber loss, analytic sparse Jacobian. Also the Sim(3) alignment used in evaluation |
 | fastapi | 0.141.1 | HTTP layer |
 | uvicorn | 0.53.0 | ASGI server |
 | python-multipart | 0.0.32 | multipart upload parsing |
